@@ -12,6 +12,11 @@ log = logging.getLogger()
 # Missing in many miseq peak files
 CHROMS_TO_IGNORE = ['chrY', 'chrM']
 
+def nan_average(values, weights=None):
+    masked_values = np.ma.masked_array(values, np.isnan(values))
+    avg = np.ma.average(masked_values, weights=weights)
+    return avg.filled(np.nan)
+
 
 class GenomeLoopData:
     """
@@ -471,10 +476,10 @@ class GenomeLoopData:
             window_starts = []
             window_ends = []
 
-            with open(f'{output_dir}/{param_str}/comparisons/{comparison_name}/'
-                      f'{chrom_name}.txt', 'w') as out_file:
-                out_file.write(
-                    f'sample_name\tchrom_name\twindow_start\twindow_end\tnumb_nonzeros\tnumb_zeros\n')
+            # with open(f'{output_dir}/{param_str}/comparisons/{comparison_name}/'
+            #           f'{chrom_name}.txt', 'w') as out_file:
+            #     out_file.write(
+            #         f'sample_name\tchrom_name\twindow_start\twindow_end\tnumb_nonzeros\tnumb_zeros\n')
 
             # Compare all windows in chromosome
             for k in range(numb_windows):
@@ -509,20 +514,20 @@ class GenomeLoopData:
             chrom_comp_values = []
             try:  # Weigh value from each window according to max loop in graph
                 # Weighted averages (indices 0-5)
-                chrom_comp_values.append(np.average(emd_values, weights=weights)) # 0: EMD (weighted)
-                chrom_comp_values.append(np.average(j_values, weights=weights)) # 1: JSD (weighted)
-                chrom_comp_values.append(np.average(cosine_dists, weights=weights)) # 2: Cosine (weighted)
-                chrom_comp_values.append(np.average(white_cosine_dists, weights=weights)) # 3: White Cosine (weighted)
-                chrom_comp_values.append(np.average(graph_jsd_dists, weights=weights)) # 4: Graph JSD (weighted)
-                chrom_comp_values.append(np.average(fgw_dists, weights=weights)) # 5: FGW (weighted)
+                chrom_comp_values.append(nan_average(emd_values, weights=weights)) # 0: EMD (weighted)
+                chrom_comp_values.append(nan_average(j_values, weights=weights)) # 1: JSD (weighted)
+                chrom_comp_values.append(nan_average(cosine_dists, weights=weights)) # 2: Cosine (weighted)
+                chrom_comp_values.append(nan_average(white_cosine_dists, weights=weights)) # 3: White Cosine (weighted)
+                chrom_comp_values.append(nan_average(graph_jsd_dists, weights=weights)) # 4: Graph JSD (weighted)
+                chrom_comp_values.append(nan_average(fgw_dists, weights=weights)) # 5: FGW (weighted)
                 
                 # Unweighted averages (indices 6-11)
-                chrom_comp_values.append(np.mean(emd_values)) # 6: EMD (unweighted)
-                chrom_comp_values.append(np.mean(j_values)) # 7: JSD (unweighted)
-                chrom_comp_values.append(np.mean(cosine_dists)) # 8: Cosine (unweighted)
-                chrom_comp_values.append(np.mean(white_cosine_dists)) # 9: White Cosine (unweighted)
-                chrom_comp_values.append(np.mean(graph_jsd_dists)) # 10: Graph JSD (unweighted)
-                chrom_comp_values.append(np.mean(fgw_dists)) # 11: FGW (unweighted)
+                chrom_comp_values.append(nan_average(emd_values)) # 6: EMD (unweighted)
+                chrom_comp_values.append(nan_average(j_values)) # 7: JSD (unweighted)
+                chrom_comp_values.append(nan_average(cosine_dists)) # 8: Cosine (unweighted)
+                chrom_comp_values.append(nan_average(white_cosine_dists)) # 9: White Cosine (unweighted)
+                chrom_comp_values.append(nan_average(graph_jsd_dists)) # 10: Graph JSD (unweighted)
+                chrom_comp_values.append(nan_average(fgw_dists)) # 11: FGW (unweighted)
 
             except ZeroDivisionError:  # sum of weights == 0
                 log.exception(f"No loops were found in either graphs. Skipping"

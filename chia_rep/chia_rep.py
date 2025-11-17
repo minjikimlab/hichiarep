@@ -3,10 +3,10 @@ from collections import OrderedDict
 import time
 import csv
 import logging
-from pyBedGraph import BedGraph
 from typing import Dict, List, Union
 
-from .genome_loop_data import GenomeLoopData
+# from .genome_loop_data import GenomeLoopData
+from .genome_bin_data import GenomeBinData
 import numpy as np
 
 log = logging.getLogger()
@@ -39,33 +39,22 @@ def output_score(
 
 
 def output_to_csv(
-    emd_scores: score_dict,
-    j_scores: score_dict,
-    cosine_scores: score_dict,
-    white_cosine_scores: score_dict,
-    graph_jsd_scores: score_dict,
-    fgw_scores: score_dict,
-    emd_scores_unweighted: score_dict,
-    j_scores_unweighted: score_dict,
-    cosine_scores_unweighted: score_dict,
-    white_cosine_scores_unweighted: score_dict,
-    graph_jsd_scores_unweighted: score_dict,
-    fgw_scores_unweighted: score_dict,
+    weighted_scores: score_dict,
+    unweighted_scores: score_dict,
+    method: str,
     window_size: int,
     bin_size: int,
-    num_peaks: any,
     output_dir: str = 'output'
 ) -> None:
     """
-    Outputs emd_scores and j_scores to a specified file path.
+    Outputs weighted and unweighted scores to a specified file path.
 
     Parameters
     ----------
-    emd_scores
-    j_scores
+    weighted_scores
+    unweighted_scores
     window_size
     bin_size
-    num_peaks
     output_dir
         Directory to output scores
 
@@ -73,42 +62,32 @@ def output_to_csv(
     ------
     None
     """
-    param_str = f'{window_size}.{bin_size}.{num_peaks}'
+    param_str = f'{window_size}.{bin_size}.{method}'
     score_dir = f'{output_dir}/{param_str}/scores'
     os.makedirs(score_dir, exist_ok=True)
 
     # Weighted scores
-    output_score(emd_scores, f'{score_dir}/emd_complete.csv')
-    output_score(j_scores, f'{score_dir}/j_complete.csv')
-    output_score(cosine_scores, f'{score_dir}/cosine_complete.csv')
-    output_score(white_cosine_scores, f'{score_dir}/white_cosine_complete.csv')
-    output_score(graph_jsd_scores, f'{score_dir}/graph_jsd_complete.csv')
-    output_score(fgw_scores, f'{score_dir}/fgw_complete.csv')
-
+    output_score(weighted_scores, f'{score_dir}/weighted_scores.csv')
     # Unweighted scores
-    output_score(emd_scores_unweighted, f'{score_dir}/emd_unweighted.csv')
-    output_score(j_scores_unweighted, f'{score_dir}/j_unweighted.csv')
-    output_score(cosine_scores_unweighted, f'{score_dir}/cosine_unweighted.csv')
-    output_score(white_cosine_scores_unweighted, f'{score_dir}/white_cosine_unweighted.csv')
-    output_score(graph_jsd_scores_unweighted, f'{score_dir}/graph_jsd_unweighted.csv')
-    output_score(fgw_scores_unweighted, f'{score_dir}/fgw_unweighted.csv')
+    output_score(unweighted_scores, f'{score_dir}/unweighted_scores.csv')
 
     log.info(f"Results have been written to {score_dir}")
 
 
 def compare(
     sample_dict: OrderedDict,
-    num_peaks: any,
+    method: str = 'fgw',
+    cost: str = 'linear',
     compare_list: list = None,
     compare_list_file: str = None,
     output_dir: str = 'output',
     window_size: int = 3000000,
     window_stride: int = 1,
     bin_size: int = 5000,
-    option: str = None,
     alpha: float = 0.5,
-    density_method: Union[str, float] = 'L2',
-    do_output_graph: bool = False
+    do_output_graph: bool = False,
+    gvmax: float = 99.5,
+    num_cores: int = 1
 ) -> (score_dict, score_dict):
     """
     Compares specified samples against each other. Specify comparisons in either
@@ -118,8 +97,6 @@ def compare(
     ----------
     sample_dict : OrderedDict
         (Key: sample name, value: sample data)
-    num_peaks : any
-        Number of peaks to use when creating folder name for results.
     compare_list : list, optional
         List of comparisons to make. Shape is n x 2 where n is the number of
         comparisons
@@ -171,70 +148,20 @@ def compare(
         to_compare_list = compare_list
 
     # To easily output in .csv format
-    emd_scores = OrderedDict()
-    j_scores = OrderedDict()
-    cosine_scores = OrderedDict()
-    white_cosine_scores = OrderedDict()
-    graph_jsd_scores = OrderedDict()
-    fgw_scores = OrderedDict()
-
-    emd_scores_unweighted = OrderedDict()
-    j_scores_unweighted = OrderedDict()
-    cosine_scores_unweighted = OrderedDict()
-    white_cosine_scores_unweighted = OrderedDict()
-    graph_jsd_scores_unweighted = OrderedDict()
-    fgw_scores_unweighted = OrderedDict()
+    scores_weighted = OrderedDict()
+    scores_unweighted = OrderedDict()
 
     for key in sample_list:
-        emd_scores[key] = OrderedDict()
-        emd_scores[key][key] = 1
-        emd_scores[key]['Sample Name'] = key
-
-        j_scores[key] = OrderedDict()
-        j_scores[key][key] = 1
-        j_scores[key]['Sample Name'] = key
-
         # The new distances are distances not similarities
         # So diagonal is 0
-        cosine_scores[key] = OrderedDict()
-        cosine_scores[key][key] = 0
-        cosine_scores[key]['Sample Name'] = key
+        scores_weighted[key] = OrderedDict()
+        scores_weighted[key][key] = 0
+        scores_weighted[key]['Sample Name'] = key
 
-        white_cosine_scores[key] = OrderedDict()
-        white_cosine_scores[key][key] = 0
-        white_cosine_scores[key]['Sample Name'] = key
+        scores_unweighted[key] = OrderedDict()
+        scores_unweighted[key][key] = 0
+        scores_unweighted[key]['Sample Name'] = key
 
-        graph_jsd_scores[key] = OrderedDict()
-        graph_jsd_scores[key][key] = 0
-        graph_jsd_scores[key]['Sample Name'] = key
-
-        fgw_scores[key] = OrderedDict()
-        fgw_scores[key][key] = 0
-        fgw_scores[key]['Sample Name'] = key
-
-        emd_scores_unweighted[key] = OrderedDict()
-        emd_scores_unweighted[key][key] = 1
-        emd_scores_unweighted[key]['Sample Name'] = key
-
-        j_scores_unweighted[key] = OrderedDict()
-        j_scores_unweighted[key][key] = 1
-        j_scores_unweighted[key]['Sample Name'] = key
-
-        cosine_scores_unweighted[key] = OrderedDict()
-        cosine_scores_unweighted[key][key] = 0
-        cosine_scores_unweighted[key]['Sample Name'] = key
-
-        white_cosine_scores_unweighted[key] = OrderedDict()
-        white_cosine_scores_unweighted[key][key] = 0
-        white_cosine_scores_unweighted[key]['Sample Name'] = key
-
-        graph_jsd_scores_unweighted[key] = OrderedDict()
-        graph_jsd_scores_unweighted[key][key] = 0
-        graph_jsd_scores_unweighted[key]['Sample Name'] = key
-
-        fgw_scores_unweighted[key] = OrderedDict()
-        fgw_scores_unweighted[key][key] = 0
-        fgw_scores_unweighted[key]['Sample Name'] = key
 
     comparison_timings = OrderedDict()
     for comparison in to_compare_list:
@@ -249,62 +176,28 @@ def compare(
         if sample1.species_name != sample2.species_name:
             log.error('Tried to compare two different species. Skipping')
 
-        value_dict = sample1.compare(sample2, window_size, window_stride, bin_size, num_peaks, 
-                                     option=option, alpha=alpha, density_method=density_method,
+        value_dict = sample1.compare(sample2, window_size, window_stride, bin_size,
+                                     alpha=alpha, method=method, cost=cost,
                                      output_dir=output_dir,
-                                     do_output_graph=do_output_graph) 
+                                     do_output_graph=do_output_graph,
+                                     gvmax=gvmax,
+                                     num_cores=num_cores)
 
         # Save values in OrderedDict
-        emd_value = value_dict['emd_value']
-        j_value = value_dict['j_value']
-        cosine_dist = value_dict['cosine_dist']
-        white_cosine = value_dict['white_cosine_dist']
-        graph_jsd = value_dict['graph_jsd_dist']
-        fgw = value_dict['fgw_dist']
+        dist_weighted = value_dict['dist_weighted']
+        dist_unweighted = value_dict['dist_unweighted']
 
-        emd_scores[sample1_name][sample2_name] = emd_value
-        emd_scores[sample2_name][sample1_name] = emd_value
-        j_scores[sample1_name][sample2_name] = j_value
-        j_scores[sample2_name][sample1_name] = j_value
-        cosine_scores[sample1_name][sample2_name] = cosine_dist
-        cosine_scores[sample2_name][sample1_name] = cosine_dist
-        white_cosine_scores[sample1_name][sample2_name] = white_cosine
-        white_cosine_scores[sample2_name][sample1_name] = white_cosine
-        graph_jsd_scores[sample1_name][sample2_name] = graph_jsd
-        graph_jsd_scores[sample2_name][sample1_name] = graph_jsd
-        fgw_scores[sample1_name][sample2_name] = fgw
-        fgw_scores[sample2_name][sample1_name] = fgw
+        scores_weighted[sample1_name][sample2_name] = dist_weighted
+        scores_weighted[sample2_name][sample1_name] = dist_weighted
 
-        emd_value_uw = value_dict['emd_value_unweighted']
-        j_value_uw = value_dict['j_value_unweighted']
-        cosine_dist_uw = value_dict['cosine_dist_unweighted']
-        white_cosine_uw = value_dict['white_cosine_dist_unweighted']
-        graph_jsd_uw = value_dict['graph_jsd_dist_unweighted']
-        fgw_uw = value_dict['fgw_dist_unweighted']
+        scores_unweighted[sample1_name][sample2_name] = dist_unweighted
+        scores_unweighted[sample2_name][sample1_name] = dist_unweighted
 
-        emd_scores_unweighted[sample1_name][sample2_name] = emd_value_uw
-        emd_scores_unweighted[sample2_name][sample1_name] = emd_value_uw
-        j_scores_unweighted[sample1_name][sample2_name] = j_value_uw
-        j_scores_unweighted[sample2_name][sample1_name] = j_value_uw
-        cosine_scores_unweighted[sample1_name][sample2_name] = cosine_dist_uw
-        cosine_scores_unweighted[sample2_name][sample1_name] = cosine_dist_uw
-        white_cosine_scores_unweighted[sample1_name][sample2_name] = white_cosine_uw
-        white_cosine_scores_unweighted[sample2_name][sample1_name] = white_cosine_uw
-        graph_jsd_scores_unweighted[sample1_name][sample2_name] = graph_jsd_uw
-        graph_jsd_scores_unweighted[sample2_name][sample1_name] = graph_jsd_uw
-        fgw_scores_unweighted[sample1_name][sample2_name] = fgw_uw
-        fgw_scores_unweighted[sample2_name][sample1_name] = fgw_uw
-
-        log.info(f'{comparison_name} emd_value: {emd_value}')
-        log.info(f'{comparison_name} j_value: {j_value}')
-        log.info(f'{comparison_name} cosine_dist: {cosine_dist}')
-        log.info(f'{comparison_name} white_cosine_dist: {white_cosine}')
-        log.info(f'{comparison_name} graph_jsd_dist: {graph_jsd}')
-        log.info(f'{comparison_name} fgw_dist: {fgw}')
+        log.info(f'{comparison_name} {method}: {dist_weighted:.3g} (weighted), {dist_unweighted:.3g} (unweighted)')
 
         comparison_timings[comparison_name] = time.time() - comparison_start_time
 
-    param_str = f'{window_size}.{bin_size}.{num_peaks}'
+    param_str = f'{window_size}.{bin_size}.{method}'
     with open(f'{output_dir}/timings/comparison.{param_str}.txt',
               'w') as out_file:
         out_file.write(f'comparison\ttime_taken\n')
@@ -312,9 +205,7 @@ def compare(
             out_file.write(f'{comparison_name}\t{compare_timing}\n')
         out_file.write(f'total\t{time.time() - total_start_time}\n')
 
-    return (emd_scores, j_scores, cosine_scores, white_cosine_scores, graph_jsd_scores, fgw_scores,
-            emd_scores_unweighted, j_scores_unweighted, cosine_scores_unweighted, 
-            white_cosine_scores_unweighted, graph_jsd_scores_unweighted, fgw_scores_unweighted)
+    return scores_weighted, scores_unweighted
 
 def check_results(rep, non_rep, out_file_dir=None, desc_str=None):
     """
@@ -407,13 +298,15 @@ def check_results(rep, non_rep, out_file_dir=None, desc_str=None):
 def read_data(
     input_data_file: str,
     chrom_size_file: str,
-    min_loop_value: int = 1,
-    min_bedgraph_value: int = 1,
     chroms_to_load: List[str] = None,
-    use_bigwig: bool = False,
+    window_size: int = 3000000,
+    window_stride: int = 2,
+    normalization: str = 'NONE',
     bin_size: int = 1,
-    output_dir: str = 'output'
-) -> Dict[str, GenomeLoopData]:
+    output_dir: str = 'output',
+    min_hic_value: int = 1,
+    min_bedgraph_value: int = 1
+) -> Dict[str, GenomeBinData]:
     """
     Reads all samples that are found in loop_data_dir.
 
@@ -425,15 +318,11 @@ def read_data(
     input_data_file : str
         File with file paths to all necessary input files.
         Format:
-        sample1_name bedgraph1_file   peak1_file   loop2_file
-        sample2_name bedgraph2_file   peak2_file   loop1_file
+        sample1_name bedgraph1_file   hic1_file
+        sample2_name bedgraph2_file   hic2_file
         ...
     chrom_size_file : str
         Path to chromosome size file
-    min_loop_value : int, optional
-        Minimum loop value accepted by GenomeLoopData/ChromLoopData
-    min_bedgraph_value : int, optional
-        Minimum value accepted by BedGraph obj from pyBedGraph
     chroms_to_load : list, optional
         Specify specific chromosomes to load instead of the entire genome
     use_bigwig : bool, optional
@@ -445,7 +334,7 @@ def read_data(
 
     Returns
     -------
-    OrderedDict[str, GenomeLoopData]
+    OrderedDict[str, GenomeBinData]
     """
     total_start_time = time.time()
     os.makedirs(f'{output_dir}/timings', exist_ok=True)
@@ -464,7 +353,7 @@ def read_data(
     with open(input_data_file) as in_file:
         for line in in_file:
             sample_files = line.split()
-            if len(sample_files) != 4:
+            if len(sample_files) != 3:
                 log.error(f"Invalid number of columns in {input_data_file}")
                 return sample_data_dict
             input_sample_files.append(sample_files)
@@ -475,12 +364,11 @@ def read_data(
 
         sample_name = sample_files[0]
         bedgraph_file = sample_files[1]
-        peak_file = sample_files[2]
-        loop_file = sample_files[3]
+        hic_file = sample_files[2]
 
         # Check for file validity
         invalid_file = False
-        for i in range(1, 4):
+        for i in range(1, 3):
             if not os.path.isfile(sample_files[i]):
                 log.error(f"Data file: {sample_files[i]} is not a valid file")
                 invalid_file = True
@@ -490,15 +378,16 @@ def read_data(
 
         log.info(f'Loading {sample_name} ...')
 
-        peak_dict = read_peak_file(peak_file)
-        bedgraph = BedGraph(chrom_size_file, bedgraph_file,
-                            chroms_to_load=chroms_to_load,
-                            ignore_missing_bp=False,
-                            min_value=min_bedgraph_value)
+        # gld = GenomeLoopData(chrom_size_file, loop_file, bedgraph,
+        #                      peak_dict, min_loop_value=min_loop_value,
+        #                      chroms_to_load=chroms_to_load, bin_size=bin_size)
 
-        gld = GenomeLoopData(chrom_size_file, loop_file, bedgraph,
-                             peak_dict, min_loop_value=min_loop_value,
-                             chroms_to_load=chroms_to_load, bin_size=bin_size)
+        gld = GenomeBinData(chrom_size_file, bedgraph_file, hic_file,
+                            window_size, window_stride, normalization,
+                            chroms_to_load=chroms_to_load, bin_size=bin_size,
+                            min_hic_value=min_hic_value, min_bedgraph_value=min_bedgraph_value)
+
+
         sample_data_dict[sample_name] = gld
         sample_timings[sample_name] = time.time() - sample_start_time
 
@@ -513,12 +402,13 @@ def read_data(
 
 def preprocess(
     sample_dict: OrderedDict,
-    num_peaks: int = None,
     both_peak_support: bool = False,
     output_dir: str = 'output',
     base_chrom: str = 'chr1'
 ) -> None:
     """
+    DEPRECATED
+
     Takes num_peaks top peaks from the peak file for base_chrom and uses the
     same ratio for each other chromosome.
     Preprocess all the chromosomes in this object.

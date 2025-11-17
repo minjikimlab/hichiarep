@@ -764,6 +764,9 @@ class ChromLoopData:
         peak_list: list,
         both_peak_support: bool = False
     ) -> bool:
+        """
+        DEPRECATED
+        """
         return self.filter_with_peaks(peak_list, both_peak_support)
 
     def filter_with_peaks(
@@ -772,6 +775,8 @@ class ChromLoopData:
         both_peak_support: bool = False
     ) -> bool:
         """
+        DEPRECATED
+
         Filters out loops without peak support.
 
         Get coverage of peaks that have been chosen to be used. Find loops that
@@ -1110,82 +1115,92 @@ class ChromLoopData:
         max_o_graph = np.max(o_graph)
         result['w'] = max_graph / self.max_loop_value + max_o_graph / o_chrom.max_loop_value
 
-        if max_graph == 0 or max_o_graph == 0:
-            if max_graph == 0:
-                log.debug('No loops in sample A')
-            else:
-                log.debug('No loops in sample B')
+        # Disable all distance functions except FGW
+        result['j_divergence'] = np.nan
+        result['j_value'] = np.nan
+        result['emd_value'] = np.nan
+        result['linear_emd_value'] = np.nan
+        result['emd_dist'] = np.nan
 
-            result['j_divergence'] = 1
-            result['j_value'] = -1
-            result['emd_value'] = -1
-            result['linear_emd_value'] = -1
-            result['emd_dist'] = 1
+        # if max_graph == 0 or max_o_graph == 0:
+        #     if max_graph == 0:
+        #         log.debug('No loops in sample A')
+        #     else:
+        #         log.debug('No loops in sample B')
 
-            # We still need to compute the new distances
-            # so don't return results yet
+        #     result['j_divergence'] = 1
+        #     result['j_value'] = -1
+        #     result['emd_value'] = -1
+        #     result['linear_emd_value'] = -1
+        #     result['emd_dist'] = 1
 
-        else:
-            log.debug('Loops are found in both samples')
+        #     # We still need to compute the new distances
+        #     # so don't return results yet
 
-            graph_flat = graph.flatten()
-            o_graph_flat = o_graph.flatten()
+        # else:
+        #     log.debug('Loops are found in both samples')
 
-            j_divergence = jensen_shannon_divergence(graph_flat, o_graph_flat)
+        #     graph_flat = graph.flatten()
+        #     o_graph_flat = o_graph.flatten()
 
-            # Make j_value range from -1 to 1
-            j_value = 2 * (1 - j_divergence) - 1
+        #     j_divergence = jensen_shannon_divergence(graph_flat, o_graph_flat)
 
-            # Calculate emd for all rows and columns -> Take weighted average
-            emd_distance_list = []
-            emd_weight_list = []
-            for k in range(graph[0].size):
-                emd_dist, emd_weight = emd(graph[k], o_graph[k])
-                emd_distance_list.append(emd_dist)
-                emd_weight_list.append(emd_weight)
+        #     # Make j_value range from -1 to 1
+        #     j_value = 2 * (1 - j_divergence) - 1
 
-                emd_dist, emd_weight = emd(graph[:, k], o_graph[:, k])
-                emd_distance_list.append(emd_dist)
-                emd_weight_list.append(emd_weight)
+        #     # Calculate emd for all rows and columns -> Take weighted average
+        #     emd_distance_list = []
+        #     emd_weight_list = []
+        #     for k in range(graph[0].size):
+        #         emd_dist, emd_weight = emd(graph[k], o_graph[k])
+        #         emd_distance_list.append(emd_dist)
+        #         emd_weight_list.append(emd_weight)
 
-            max_emd_weight = np.max(emd_weight_list)
+        #         emd_dist, emd_weight = emd(graph[:, k], o_graph[:, k])
+        #         emd_distance_list.append(emd_dist)
+        #         emd_weight_list.append(emd_weight)
 
-            if max_emd_weight == 0:
-                overall_emd_dist = 0
-            else:
-                overall_emd_dist = np.average(emd_distance_list,
-                                            weights=emd_weight_list)
-            # overall_emd_dist = np.mean(emd_distance_list)
+        #     max_emd_weight = np.max(emd_weight_list)
 
-            # Higher emd_dist == samples are more different
-            # Lower emd_dist == samples are more similar
-            max_emd_dist = graph.shape[0] - 1
-            numerator = overall_emd_dist - max_emd_dist
-            emd_value = 2 * numerator * numerator / (
-                    max_emd_dist * max_emd_dist) - 1
+        #     if max_emd_weight == 0:
+        #         overall_emd_dist = 0
+        #     else:
+        #         overall_emd_dist = np.average(emd_distance_list,
+        #                                     weights=emd_weight_list)
+        #     # overall_emd_dist = np.mean(emd_distance_list)
 
-            # Linear scale
-            # emd_value = 1 - 2 / max_emd_dist * overall_emd_dist
-            # linear_emd_value = 1 - 2 * overall_emd_dist
+        #     # Higher emd_dist == samples are more different
+        #     # Lower emd_dist == samples are more similar
+        #     max_emd_dist = graph.shape[0] - 1
+        #     numerator = overall_emd_dist - max_emd_dist
+        #     emd_value = 2 * numerator * numerator / (
+        #             max_emd_dist * max_emd_dist) - 1
 
-            if max_emd_weight == 0 and result['w'] != 0:
-                log.error(f'Total Weight: {result["w"]} with 0 emd dist')
+        #     # Linear scale
+        #     # emd_value = 1 - 2 / max_emd_dist * overall_emd_dist
+        #     # linear_emd_value = 1 - 2 * overall_emd_dist
 
-            result['j_divergence'] = j_divergence
-            result['j_value'] = j_value
-            result['emd_value'] = emd_value
-            result['emd_dist'] = overall_emd_dist
-            # result['linear_emd_value'] = linear_emd_value
+        #     if max_emd_weight == 0 and result['w'] != 0:
+        #         log.error(f'Total Weight: {result["w"]} with 0 emd dist')
+
+        #     result['j_divergence'] = j_divergence
+        #     result['j_value'] = j_value
+        #     result['emd_value'] = emd_value
+        #     result['emd_dist'] = overall_emd_dist
+        #     # result['linear_emd_value'] = linear_emd_value
 
 
-        result['cosine_dist'] = cosine_distance(node_features, o_node_features)
-        result['white_cosine_dist'] = whitened_cosine_distance(graph, o_graph, node_features, o_node_features)
-        result['graph_jsd_dist'] = graph_jsd(graph, o_graph, node_features, o_node_features, 
-                                        alpha=alpha, density_method=density_method)
+        # Disable all distance functions except FGW
+        result['cosine_dist'] = np.nan
+        result['white_cosine_dist'] = np.nan
+        result['graph_jsd_dist'] = np.nan
+
+        # result['cosine_dist'] = cosine_distance(node_features, o_node_features)
+        # result['white_cosine_dist'] = whitened_cosine_distance(graph, o_graph, node_features, o_node_features)
+        # result['graph_jsd_dist'] = graph_jsd(graph, o_graph, node_features, o_node_features, 
+                                        # alpha=alpha, density_method=density_method)
         result['fgw_dist'] = fgw_distance(graph, o_graph, node_features, o_node_features, 
                                           use_node_features_as_weights=True, alpha=alpha)
-
-
 
         return result
 
