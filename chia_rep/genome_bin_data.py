@@ -259,7 +259,11 @@ class GenomeBinData:
             chroms_to_compare: List[str] = None,
             output_dir: str = 'output',
             do_output_graph: bool = False,
-            gvmax: float = 99.5,
+            gvmax: float = 100.0,
+            scale_cost: str = 'unitless',
+            mass: float = 1.0,
+            feat: str = 'index_BA',
+            weight: str = 'uniform',
             num_cores: int = 1
     ) -> Dict[str, float]:
         """
@@ -309,6 +313,10 @@ class GenomeBinData:
                 do_output_graph,
                 param_str,
                 gvmax=gvmax,
+                scale_cost=scale_cost,
+                mass=mass,
+                feat=feat,
+                weight=weight,
                 num_cores=num_cores
             )
             chrom_comp_values = []

@@ -86,7 +86,11 @@ def compare(
     bin_size: int = 5000,
     alpha: float = 0.5,
     do_output_graph: bool = False,
-    gvmax: float = 99.5,
+    gvmax: float = 100.0,
+    scale_cost: str = 'unitless',
+    mass: float = 1.0,
+    feat: str = 'index_BA',
+    weight: str = 'uniform',
     num_cores: int = 1
 ) -> (score_dict, score_dict):
     """
@@ -181,6 +185,10 @@ def compare(
                                      output_dir=output_dir,
                                      do_output_graph=do_output_graph,
                                      gvmax=gvmax,
+                                     scale_cost=scale_cost,
+                                     mass=mass,
+                                     feat=feat,
+                                     weight=weight,
                                      num_cores=num_cores)
 
         # Save values in OrderedDict
