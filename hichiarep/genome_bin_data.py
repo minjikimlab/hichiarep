@@ -639,6 +639,7 @@ class GenomeBinData:
             mu: Union[float, int] = 1.0,
             compare_method: str = 'spearman',
             cross: bool = False,
+            ssp: float = None,
             num_cores: int = 1,
             param_str: str = '',
     ) -> Dict[str, float]:
@@ -695,6 +696,7 @@ class GenomeBinData:
                 mu=mu,
                 compare_method=compare_method,
                 cross=cross,
+                ssp=ssp,
                 num_cores=num_cores
             )
             chrom_comp_values = []

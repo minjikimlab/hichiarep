@@ -54,17 +54,18 @@ def parse_float(ctx, param, value):
 @click.option('--compare-method', default='spearman', type=str)
 @click.option('--cross', default=False, type=bool)
 @click.option('--ba-mult', default=1, type=int)
+@click.option('--ssp', default=None, type=float)
 @click.option('--num-cores', default=1, type=int)
 @click.option('--diagnostic-plots', default=True, type=bool)
 def main(input_data_file, chrom_size_file, compare_list_file, window_size, bin_size, chroms_to_load,
          min_hic_value, min_bedgraph_value, do_output_graph, output_dir, window_stride, num_peaks, 
-         normalization, method, mu, compare_method, cross, ba_mult, num_cores, diagnostic_plots):
+         normalization, method, mu, compare_method, cross, ba_mult, ssp, num_cores, diagnostic_plots):
     click.echo(f"Running HiChIA-Rep v{hichiarep.__version__}")
     
     if 'all' in chroms_to_load or len(chroms_to_load) == 0:
         chroms_to_load = None
 
-    param_str = f'{window_size}.{bin_size}.{normalization}.{method}.{mu}.{compare_method}.{cross}.{ba_mult}'
+    param_str = f'{window_size}.{bin_size}.{normalization}.{method}.{mu}.{compare_method}.{cross}.{ba_mult}.{ssp}'
 
     sample_data_dict = hichiarep.read_data(input_data_file, chrom_size_file, chroms_to_load,
                                           window_size=window_size, window_stride=window_stride, normalization=normalization,
@@ -78,6 +79,7 @@ def main(input_data_file, chrom_size_file, compare_list_file, window_size, bin_s
                               compare_list_file=compare_list_file, method=method, 
                               do_output_graph=do_output_graph, output_dir=output_dir, 
                               mu=mu, compare_method=compare_method, cross=cross,
+                              ssp=ssp,
                               num_cores=num_cores, param_str=param_str)
     
     hichiarep.output_to_csv(None, scores_unweighted,

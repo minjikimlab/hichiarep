@@ -90,6 +90,7 @@ def compare(
     mu: Union[float, int] = 1.0,
     compare_method: str = 'spearman',
     cross: bool = False,
+    ssp: float = None,
     num_cores: int = 1,
     param_str: str = None
 ) -> (score_dict, score_dict):
@@ -155,6 +156,11 @@ def compare(
         Compare x11 and x12
         Compare x21 and x22
         Take average of the two comparisons
+    ssp : float
+        Subsample percentage in [0, 1]. If None, then no subsampling is done.
+        If specified as a float between 0 and 1, then that initial subsampling is done
+        to ensure the read depth is identical between any two pairs. 
+        Additional subsampling is done that is a proportion of this common read depth.
     num_cores : int
         Number of pools to use for parallel processing across the windows of a chromosome
     param_str : str
@@ -232,6 +238,7 @@ def compare(
                                      mass=mass,
                                      feat=feat,
                                      weight=weight,
+                                     ssp=ssp,
                                      num_cores=num_cores,
                                      param_str=param_str)
 

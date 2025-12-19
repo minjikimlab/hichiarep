@@ -315,11 +315,55 @@ def compare_signals(a, b, compare_method):
     else:
         raise ValueError(f'Unknown compare method: {compare_method}')
 
+def subsample(A1 : np.ndarray, A2 : np.ndarray, B1 : np.ndarray, B2: np.ndarray, p=1.0):
+    '''
+    Subsamples adjacency matrices A1, A2 and binding intensities B1, B2
+    
+    A1, A2: Input adjacency matrices with integer elements.
+    B1, B2: Input binding intensities with integer elements. 
+    p: After initial subsampling, further subsample to this level. 
+
+    Returns: Updated A1, A2, B1, B2
+
+    Author: Joseph Jackson
+    '''
+    def subsample_pair(A : np.ndarray, B : np.ndarray):
+        depthA, depthB = A.sum(), B.sum()
+            
+        if depthA == 0 or depthB == 0:
+            return A, B
+
+        if depthA > depthB:
+            A = np.random.binomial(A, depthB / depthA)
+        else:
+            B = np.random.binomial(B, depthA / depthB)
+        return A, B
+    
+    A1_sub, A2_sub = subsample_pair(np.rint(A1).astype(np.int64), np.rint(A2).astype(np.int64))
+    B1_sub, B2_sub = subsample_pair(np.rint(B1).astype(np.int64), np.rint(B2).astype(np.int64))
+    if (p < 1.0):
+        A1_sub = np.random.binomial(A1_sub, p)
+        A2_sub = np.random.binomial(A2_sub, p)
+        B1_sub = np.random.binomial(B1_sub, p)
+        B2_sub = np.random.binomial(B2_sub, p)
+
+    # Preserve data types
+    A1_sub = A1_sub.astype(A1.dtype)
+    A2_sub = A2_sub.astype(A2.dtype)
+    B1_sub = B1_sub.astype(B1.dtype)
+    B2_sub = B2_sub.astype(B2.dtype)
+
+    return A1_sub, A2_sub, B1_sub, B2_sub
 
 
 def _random_walk_gsp_worker(args):
     """ Computes random walk GSP """
-    A1, x1, A2, x2, p, compare_method, cross, skip_window = args
+    A1, x1, A2, x2, p, compare_method, cross, skip_window, ssp = args
+
+    if ssp is not None:
+        A1 = A1.toarray()
+        A2 = A2.toarray()
+        A1, A2, x1, x2 = subsample(A1, A2, x1, x2, p=ssp)
     
     sum_x1 = np.sum(x1)
     sum_x2 = np.sum(x2)
@@ -340,10 +384,11 @@ def _random_walk_gsp_worker(args):
     # that the `skip_window` check did not consider first
     if skip_window:
         return np.nan
-
-    # Lets convert to dense for blurring
-    A1 = A1.toarray()
-    A2 = A2.toarray()
+    
+    # Only make into dense if necessary
+    if ssp is None:
+        A1 = A1.toarray()
+        A2 = A2.toarray()
 
     # Blur
     np.clip(apply_mean_filter(A1, ks=3), 0, None, out=A1)
@@ -466,8 +511,13 @@ def construct_diffusion_kernel(L, t):
 
 def _diffusion_gsp_worker(args):
     """ Computes diffusion GSP """
-    A1, x1, A2, x2, t, compare_method, cross, skip_window = args
+    A1, x1, A2, x2, t, compare_method, cross, skip_window, ssp = args
 
+    if ssp is not None:
+        A1 = A1.toarray()
+        A2 = A2.toarray()
+        A1, A2, x1, x2 = subsample(A1, A2, x1, x2, p=ssp)
+    
     sum_x1 = np.sum(x1)
     sum_x2 = np.sum(x2)
     max_A1 = np.max(A1)
@@ -488,9 +538,10 @@ def _diffusion_gsp_worker(args):
     if skip_window:
         return np.nan
         
-    # Convert to dense for blurring
-    A1 = A1.toarray()
-    A2 = A2.toarray()
+    # If not already dense, convert to dense for blurring
+    if ssp is None:
+        A1 = A1.toarray()
+        A2 = A2.toarray()
 
     # Blur
     np.clip(apply_mean_filter(A1, ks=3), 0, None, out=A1)
@@ -1021,7 +1072,7 @@ class ChromBinData:
         return distances, window_weights
     
 
-    def gsp_batch(self, o_chrom, kernel_type, mu, compare_method, cross, num_cores=1):
+    def gsp_batch(self, o_chrom, kernel_type, mu, compare_method, cross, ssp, num_cores=1):
         """
         Computes the GSP distances on batches of graphs.
         Uses sparse matrices directly for efficiency with expm_multiply.
@@ -1038,6 +1089,13 @@ class ChromBinData:
             Power for random walk
         compare_method : str
             Method to compare diffusion states (e.g., "spearman", "jsd")
+        cross : bool
+            Whether to use cross comparison
+        ssp : float
+            Subsample percentage in [0, 1]. If None, then no subsampling is done.
+            If specified as a float between 0 and 1, then that initial subsampling is done
+            to ensure the read depth is identical between any two pairs. 
+            Additional subsampling is done that is a proportion of this common read depth.
         num_cores : int
             Number of cores to use
         """
@@ -1059,7 +1117,7 @@ class ChromBinData:
         skip_window = node_sparse_1 | node_sparse_2
 
         tasks = [
-            (adj_list1[i], weights1[i], adj_list2[i], weights2[i], mu, compare_method, cross, skip_window[i])
+            (adj_list1[i], weights1[i].copy(), adj_list2[i], weights2[i].copy(), mu, compare_method, cross, skip_window[i], ssp)
             for i in range(M)
         ]
 
@@ -1177,6 +1235,7 @@ class ChromBinData:
         mass: float = 1.0,
         feat: str = 'index_BA',
         weight: str = 'uniform',
+        ssp: float = None,
         num_cores: int = 1
     ):
         """
@@ -1218,8 +1277,24 @@ class ChromBinData:
             Number of pools to use for parallel processing across the windows of a chromosome
         param_str : str
             Parameter string that is the subfolder name under output_dir
+        ssp : float
+            Subsample percentage in [0, 1]. If None, then no subsampling is done.
+            If specified as a float between 0 and 1, then that initial subsampling is done
+            to ensure the read depth is identical between any two pairs. 
+            Additional subsampling is done that is a proportion of this common read depth.
 
-        
+        Returns
+        -------
+        tuple
+            A tuple containing:
+            - distances : np.ndarray
+                Array of distances for each window
+            - window_weights : np.ndarray (deprecated)
+                Array of weights for each window
+            - max_graph : np.ndarray (deprecated)
+                Array of maximum graph values for each window in this chromosome
+            - o_max_graph : np.ndarray (deprecated)
+                Array of maximum graph values for each window in the other chromosome
         """
 
         # Output graph variables if chr1
@@ -1261,7 +1336,8 @@ class ChromBinData:
         elif method in ["diffusion", "random_walk"]:
 
             distances, window_weights = self.gsp_batch(o_chrom, kernel_type=method, mu=mu, 
-                                                       compare_method=compare_method, cross=cross, num_cores=num_cores)
+                                                       compare_method=compare_method, cross=cross, ssp=ssp,
+                                                       num_cores=num_cores)
 
             output_graph(self.adjacency_matrices, self.node_weights, 
                          parent_dir, self.name, self.sample_name, do_output_graph, sparse=True)
