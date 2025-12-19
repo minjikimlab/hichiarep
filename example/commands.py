@@ -43,7 +43,7 @@ def make_sample_input_file(sample_list_file, sample_input_file, sample_data_dir,
         hic_file_path = None
         peak_file_path = None
         for file in os.scandir(sample_data_dir):
-            if (file.name.lower().endswith(bg_ext) or file.name.lower().endswith(bw_ext)) and sample_name.lower() in file.name.lower():
+            if file.name.lower().endswith(bg_ext) and sample_name.lower() in file.name.lower():
                 bg_file_path = file.path
             elif (file.name.lower().endswith(chrom_ext1)) and sample_name.lower() in file.name.lower():
                 hic_file_path = file.path
@@ -57,6 +57,14 @@ def make_sample_input_file(sample_list_file, sample_input_file, sample_data_dir,
             for file in os.scandir(sample_data_dir):
                 if (file.name.lower().endswith(chrom_ext2)) and sample_name.lower() in file.name.lower():
                     hic_file_path = file.path
+                    break
+
+        if not bg_file_path:
+            print(f"Couldn't find binding affinity file {bg_ext} for {sample_name}, trying {bw_ext}..."
+                  "To disable this behaviour, please do not include this sample in the sample list file.")
+            for file in os.scandir(sample_data_dir):
+                if (file.name.lower().endswith(bw_ext)) and sample_name.lower() in file.name.lower():
+                    bg_file_path = file.path
                     break
 
         if not bg_file_path or not hic_file_path:
