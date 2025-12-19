@@ -8,7 +8,6 @@ dependencies:
   - scipy>=1.15,<1.16
   - matplotlib>=3.10,<3.11
   - click
-  - cython
   - pybedgraph>=0.5
   - pybedtools>=0.12
   - bedtools

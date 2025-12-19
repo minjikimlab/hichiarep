@@ -13,7 +13,7 @@ from typing import Dict, Tuple, Union
 import os
 import multiprocessing as mp
 
-from .util import *
+# from .util import * # Need for `emd` but is now deprecated
 
 log = logging.getLogger()
 log_bin = logging.getLogger('bin')
@@ -26,7 +26,7 @@ def emd(
     q: np.ndarray
 ) -> Tuple[float, float]:
     """
-    LEGACY CODE
+    DEPRECATED
     Finds the Earth Mover's Distance of two 1D arrays
 
     Parameters
@@ -1187,7 +1187,7 @@ class ChromBinData:
 
         1. Adjacency matrices: MxNxN
         2. Node weights: MxN
-        
+
         where M is the number of windows and N is the number of bins per window
 
         Parameters
