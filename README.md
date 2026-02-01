@@ -161,12 +161,12 @@ The main program will then take the generated **pairs file** and **sample input 
 | `compare_list_file` | Path (required) | Path to pairs file specifying which samples to compare |
 | `window_size` | int (5000000) | Size of sliding window in base pairs |
 | `bin_size` | int (10000) | Binning resolution in base pairs |
+| `chroms_to_load` | str... (all) | Chromosomes to analyze; use "all" or leave empty for all chromosomes |
 | `-o`, `--output-dir` | str ("output") | Directory to output results |
 | `-w`, `--window-stride` | int (2) | Stride factor (e.g., 2 means stride by window_size/2) |
 | `--method` | str ("random_walk") | Comparison method: "random_walk" or "diffusion" |
 | `--mu` | float (5) | Random walk steps or diffusion time parameter |
 | `--compare-method` | str ("spearman") | Signal comparison method: "spearman" or "jsd" |
-| `chroms_to_load` | str... (all) | Chromosomes to analyze; use "all" or leave empty for all chromosomes |
 | `--ba-mult` | int (1) | Multiplier for binding affinity values (use if values are <1) |
 | `--num-cores` | int (1) | Number of cores for parallel processing |
 | `--diagnostic-plots` | bool (True) | Save diagnostic plots of peak arrays |
