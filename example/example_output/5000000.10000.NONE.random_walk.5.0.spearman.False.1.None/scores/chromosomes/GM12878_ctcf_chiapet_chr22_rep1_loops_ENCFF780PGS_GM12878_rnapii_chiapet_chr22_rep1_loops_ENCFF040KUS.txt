@@ -1,0 +1,2 @@
+chrom_name	random_walk_weighted	random_walk_unweighted
+chr22	0.44724015673557765	0.44724015673557765
