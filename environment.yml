@@ -9,9 +9,7 @@ dependencies:
   - matplotlib>=3.10,<3.11
   - click
   - pybedgraph>=0.5
-  - pybedtools>=0.12
   - pybigwig>=0.3.16
-  - bedtools
   - sphinx # Just for building docs
   - libcurl # For hic-straw
   - pip

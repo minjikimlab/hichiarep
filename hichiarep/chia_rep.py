@@ -4,7 +4,7 @@ import time
 import csv
 import logging
 from typing import Dict, List, Union
-import pybedtools
+# import pybedtools
 
 # from .genome_loop_data import GenomeLoopData
 from .genome_bin_data import GenomeBinData
@@ -572,46 +572,46 @@ def read_peak_file(
     return peak_dict
 
 
-def generate_peak_file(
-        bin_size: int,
-        chrom_size_file: str,
-) -> Dict[str, list]:
-    """
-    Generates peak dictionary of same format as read_peak_file with
-    evenly spaced peaks across all chromosomes
+# def generate_peak_file(
+#         bin_size: int,
+#         chrom_size_file: str,
+# ) -> Dict[str, list]:
+#     """
+#     Generates peak dictionary of same format as read_peak_file with
+#     evenly spaced peaks across all chromosomes
 
-    This function calls pybedtools window_maker which is a wrapper for 
-    bedtools makewindows to construct this peak dictionary
+#     This function calls pybedtools window_maker which is a wrapper for 
+#     bedtools makewindows to construct this peak dictionary
 
-    Parameters
-    ----------
-    bin_size : int
-        The resolution or window size 
-    chrom_size_file : str
-        Chromosome size file
+#     Parameters
+#     ----------
+#     bin_size : int
+#         The resolution or window size 
+#     chrom_size_file : str
+#         Chromosome size file
     
-    Returns
-    -------
-    dict[str, list]
-        Dictionary containing list of peaks start and ends for every chromosome
-    """
-    peak_dict = {}
+#     Returns
+#     -------
+#     dict[str, list]
+#         Dictionary containing list of peaks start and ends for every chromosome
+#     """
+#     peak_dict = {}
     
-    # Equivalent to: bedtools makewindows -g chrom_size_file -w bin_size
-    windows = pybedtools.BedTool().window_maker(g=chrom_size_file, w=bin_size)
+#     # Equivalent to: bedtools makewindows -g chrom_size_file -w bin_size
+#     windows = pybedtools.BedTool().window_maker(g=chrom_size_file, w=bin_size)
 
-    for feature in windows:
-        chrom = feature.chrom
-        start = feature.start
-        end = feature.end
+#     for feature in windows:
+#         chrom = feature.chrom
+#         start = feature.start
+#         end = feature.end
         
-        if chrom not in peak_dict:
-            peak_dict[chrom] = []
+#         if chrom not in peak_dict:
+#             peak_dict[chrom] = []
             
-        peak_dict[chrom].append([start, end, 
-                                 end - start])
+#         peak_dict[chrom].append([start, end, 
+#                                  end - start])
         
-    return peak_dict
+#     return peak_dict
 
 def construct_empty_peak_dict(
         chrom_size_file: str,

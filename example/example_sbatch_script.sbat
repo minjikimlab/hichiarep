@@ -23,8 +23,9 @@ python commands.py make-pairs example_sample.txt example_pairs.txt
 # This command makes the `example_sample_input_file.txt` from `example_sample.txt` 
 # It will search in the provided directory (only that level) for the appropriate files
 # Specifically, it will do a string match for the text in `example_sample.txt`, so you should name `example_sample.txt` accordingly
-python commands.py make-sample-input-file example_sample.txt example_sample_input_file.txt /nfs/turbo/umms-minjilab/sionkim/chia_rep_simlinks \
-    --use_bedpe False # Recognize Hi-C (.hic) files not .bedpe files 
+python commands.py make-sample-input-file example_sample.txt example_sample_input_file.txt \
+   /nfs/turbo/umms-minjilab/sionkim/chia_rep/example/example_data \
+   --use_bedpe True  # Recognize .bedpe files before .hic files
 
 # This command runs the reproducibility score computation
 python script.py example_sample_input_file.txt hg38.chrom.sizes example_pairs.txt 5000000 10000 all \
@@ -36,4 +37,4 @@ python script.py example_sample_input_file.txt hg38.chrom.sizes example_pairs.tx
     --mu 5 \
     --cross False \
     --num-cores 4 \
-    --compare-method jsd \
+    --compare-method spearman \
