@@ -1,18 +1,29 @@
 import os
+import re
+import math
 from collections import OrderedDict
 import time
 import csv
 import logging
-from typing import Dict, List, Union
+from typing import Dict, List, Tuple, Union
 # import pybedtools
 
 # from .genome_loop_data import GenomeLoopData
-from .genome_bin_data import GenomeBinData
+from .genome_bin_data import GenomeBinData, WINDOW_WEIGHTINGS, check_alt_chrom_name, read_chrom_sizes, \
+    standardize_chrom_name
 import numpy as np
 
 log = logging.getLogger()
 # score_dict = OrderedDict[str, OrderedDict[str, float]]
 score_dict = Dict[str, Dict[str, float]]
+
+# Limits of the single window compared for a genomic_location (see `parse_genomic_location`)
+MIN_REGION_SPAN = 20000 # 20 kb, minimum span of the requested region
+MIN_REGION_BINS = 10     # The window matrix is at least 10 x 10
+MAX_REGION_BINS = 1000  # and at most 1000 x 1000
+
+# 'chrom:start-end', commas allowed in the coordinates
+GENOMIC_LOCATION_RE = re.compile(r'([^:\s]+):(\d[\d,]*)-(\d[\d,]*)')
 
 
 def output_score(
@@ -40,7 +51,7 @@ def output_score(
 
 
 def output_to_csv(
-    weighted_scores: score_dict,
+    weighted_scores: Dict[str, score_dict],
     unweighted_scores: score_dict,
     output_dir: str = 'output',
     param_str: str = None
@@ -51,6 +62,8 @@ def output_to_csv(
     Parameters
     ----------
     weighted_scores
+        Key: window weighting (currently only 'beta'), value: scores.
+        Each is written to {weighting}_weighted_scores.csv
     unweighted_scores
     output_dir
         Directory to output scores
@@ -63,8 +76,9 @@ def output_to_csv(
     os.makedirs(score_dir, exist_ok=True)
 
     if weighted_scores is not None:
-        # Weighted scores
-        output_score(weighted_scores, f'{score_dir}/weighted_scores.csv')
+        # Weighted scores, one file per window weighting
+        for weighting, scores in weighted_scores.items():
+            output_score(scores, f'{score_dir}/{weighting}_weighted_scores.csv')
 
     if unweighted_scores is not None:
         # Unweighted scores
@@ -92,8 +106,12 @@ def compare(
     cross: bool = False,
     ssp: float = None,
     num_cores: int = 1,
-    param_str: str = None
-) -> (score_dict, score_dict):
+    param_str: str = None,
+    report_conv_it: bool = False,
+    live_bin_rule: str = 'either',
+    min_live_bins: int = 10,
+    shapley: bool = False
+) -> (score_dict, Dict[str, score_dict]):
     """
     Compares specified samples against each other. Specify comparisons in either
     compare_list or compare_list_file.
@@ -159,16 +177,69 @@ def compare(
     ssp : float
         Subsample percentage in [0, 1]. If None, then no subsampling is done.
         If specified as a float between 0 and 1, then that initial subsampling is done
-        to ensure the read depth is identical between any two pairs. 
+        to ensure the read depth is identical between any two pairs.
         Additional subsampling is done that is a proportion of this common read depth.
+        The subsampling of every window is seeded by the pair, the chromosome and the window,
+        so it is reproducible and does not depend on `num_cores`
     num_cores : int
-        Number of pools to use for parallel processing across the windows of a chromosome
+        Number of pools to use for parallel processing across the windows of a chromosome.
+        Ignored for samples loaded for a genomic_location, which hold a single window
     param_str : str
         Parameter string that is the subfolder name under output_dir
+    report_conv_it : bool
+        Whether to report the iteration at which the random walk of each sample
+        converged, i.e. the smallest k with
+
+            ||P^(k+1) - P^k||_F / ||P^k||_F < 1e-6
+
+        Written as two extra columns in the per-window score files.
+        Only applies to method='random_walk'
+    live_bin_rule : str
+        A bin is dead on one side of a window pair if its column of the coverage
+        weighted adjacency matrix (before the blur) sums to 0. Dead bins are removed
+        (rows / columns of A and entries of the binding affinity, on both sides)
+        before the random walk:
+
+        - 'either': drop bins dead on either side (keep the intersection of the live bins)
+        - 'both': drop bins dead on both sides only (keep the union of the live bins)
+        - 'none': keep every bin
+
+        Only applies to method='random_walk'
+    min_live_bins : int
+        Windows with fewer live bins are skipped (nan).
+        Only applies to method='random_walk'
+    shapley : bool
+        Whether to also compute the Shapley attribution of every window score W_SB.
+        Each window pair is scored twice more on the same live bins: W_S with the binding
+        affinity replaced by ones (structure only) and W_B with the chromatin structure
+        replaced by the identity (binding only). The per-window score files gain the
+        columns W_S, W_B and alpha_shapley, the share of W_SB attributed to structure
+        (nan if |W_SB| <= 0.1 or if a Shapley value is negative). Roughly triples the time
+        of the comparisons, and the samples must be loaded with read_data(..., shapley=True).
+        Only applies to method='random_walk' without subsampling (ssp=None)
     Returns
     -------
-    OrderedDict containing unweighted scores
+    OrderedDict containing unweighted scores, and a dict (key: window weighting) of
+    OrderedDicts containing weighted scores. The only window weighting is
+
+    - 'beta': beta_i = n_live / N, the fraction of bins kept by the live bin mask
+      (all ones for methods other than 'random_walk')
+
+    normalized to a PMF over the scored windows of a chromosome
     """
+    if shapley and (method != 'random_walk' or ssp is not None):
+        log.error(f'The Shapley attribution is only implemented for method="random_walk" without '
+                  f'subsampling, got method="{method}" and ssp={ssp}')
+        raise ValueError(f'The Shapley attribution is only implemented for method="random_walk" without '
+                         f'subsampling, got method="{method}" and ssp={ssp}')
+
+    # Samples loaded for a genomic_location hold a single window, so there are no windows to
+    # parallelize across. Scored in the main process, the window also keeps every BLAS thread
+    # for its dense random walk instead of the one thread of a pool worker
+    if num_cores > 1 and any(sample.region is not None for sample in sample_dict.values()):
+        log.info(f'Single window (genomic_location): ignoring num_cores={num_cores}')
+        num_cores = 1
+
     total_start_time = time.time()
     os.makedirs(f'{output_dir}/timings', exist_ok=True)
     sample_list = list(sample_dict.keys())
@@ -196,15 +267,17 @@ def compare(
         to_compare_list = compare_list
 
     # To easily output in .csv format
-    scores_weighted = OrderedDict() # Deprecated
+    # One score table per window weighting (beta)
+    scores_weighted = OrderedDict((weighting, OrderedDict()) for weighting in WINDOW_WEIGHTINGS)
     scores_unweighted = OrderedDict()
 
     for key in sample_list:
         # The new distances are distances not similarities
         # So diagonal is 0
-        scores_weighted[key] = OrderedDict()
-        scores_weighted[key][key] = 0
-        scores_weighted[key]['Sample Name'] = key
+        for scores in scores_weighted.values():
+            scores[key] = OrderedDict()
+            scores[key][key] = 0
+            scores[key]['Sample Name'] = key
 
         scores_unweighted[key] = OrderedDict()
         scores_unweighted[key][key] = 0
@@ -240,19 +313,25 @@ def compare(
                                      weight=weight,
                                      ssp=ssp,
                                      num_cores=num_cores,
-                                     param_str=param_str)
+                                     param_str=param_str,
+                                     report_conv_it=report_conv_it,
+                                     live_bin_rule=live_bin_rule,
+                                     min_live_bins=min_live_bins,
+                                     shapley=shapley)
 
         # Save values in OrderedDict
-        dist_weighted = value_dict['dist_weighted']
-        dist_unweighted = value_dict['dist_unweighted']
+        for weighting, scores in scores_weighted.items():
+            dist_weighted = value_dict[f'dist_{weighting}_weighted']
+            scores[sample1_name][sample2_name] = dist_weighted
+            scores[sample2_name][sample1_name] = dist_weighted
 
-        scores_weighted[sample1_name][sample2_name] = dist_weighted
-        scores_weighted[sample2_name][sample1_name] = dist_weighted
+        dist_unweighted = value_dict['dist_unweighted']
 
         scores_unweighted[sample1_name][sample2_name] = dist_unweighted
         scores_unweighted[sample2_name][sample1_name] = dist_unweighted
 
-        log.info(f'{comparison_name} {method}: {dist_unweighted:.3g}')
+        weighted_str = ', '.join(f'{w}: {value_dict[f"dist_{w}_weighted"]:.3g}' for w in WINDOW_WEIGHTINGS)
+        log.info(f'{comparison_name} {method}: {dist_unweighted:.3g} (weighted {weighted_str})')
 
         comparison_timings[comparison_name] = time.time() - comparison_start_time
 
@@ -263,7 +342,7 @@ def compare(
             out_file.write(f'{comparison_name}\t{compare_timing}\n')
         out_file.write(f'total\t{time.time() - total_start_time}\n')
 
-    return scores_unweighted, None
+    return scores_unweighted, scores_weighted
 
 def check_results(rep, non_rep, out_file_dir=None, desc_str=None):
     """
@@ -353,6 +432,79 @@ def check_results(rep, non_rep, out_file_dir=None, desc_str=None):
             out_file.close()
 
 
+def parse_genomic_location(
+    genomic_location: str,
+    chrom_size_file: str,
+    bin_size: int
+) -> Union[Tuple[str, int, int], None]:
+    """
+    Parses a genomic region into the single window that is compared instead of the
+    sliding windows of every chromosome
+
+    The window is the smallest run of whole bins that covers the region: the start is
+    rounded down and the end is rounded up to a multiple of `bin_size`. The region must
+    span at least MIN_REGION_SPAN (20 kb), and the window must have MIN_REGION_BINS to
+    MAX_REGION_BINS bins, i.e. an adjacency matrix between 3 x 3 and 1000 x 1000
+
+    Parameters
+    ----------
+    genomic_location : str
+        'all' for the sliding windows of the whole genome, or a region 'chrom:start-end'
+        such as 'chr5:3000000-5000000'. start and end are in bp and form the half open
+        interval [start, end), as in a BED file. Commas are allowed ('chr5:3,000,000-5,000,000')
+        and the chromosome may be given with or without the 'chr' prefix ('5:3000000-5000000')
+    chrom_size_file : str
+        Chromosome size file, which may name the chromosome with or without the 'chr' prefix
+    bin_size : int
+        Binning resolution
+
+    Returns
+    -------
+    None if `genomic_location` is 'all', otherwise (chrom, window_start, window_end)
+    where chrom is standardized to 'chr*' (e.g. 'chr5')
+
+    Raises
+    ------
+    ValueError
+        If the region is malformed, is not within the chromosome or breaks one of the limits
+    """
+    if genomic_location is None or genomic_location == 'all':
+        return None
+
+    match = GENOMIC_LOCATION_RE.fullmatch(genomic_location.strip())
+    if match is None:
+        log.error(f'Invalid genomic_location "{genomic_location}": expected "chrom:start-end", '
+                  f'e.g. "chr5:3000000-5000000"')
+        raise ValueError(f'Invalid genomic_location "{genomic_location}": expected "chrom:start-end", '
+                         f'e.g. "chr5:3000000-5000000"')
+
+    chrom = standardize_chrom_name(match.group(1))
+    start, end = (int(x.replace(',', '')) for x in match.group(2, 3))
+
+    # Smallest run of whole bins covering [start, end)
+    window_start = math.floor(start / bin_size) * bin_size
+    window_end = math.ceil(end / bin_size) * bin_size
+    num_bins = (window_end - window_start) // bin_size
+
+    chrom_sizes = read_chrom_sizes(chrom_size_file)
+    size_chrom_name = check_alt_chrom_name(chrom, list(chrom_sizes))
+
+    if size_chrom_name is None:
+        error = f'{chrom} (or {chrom[3:]}) not found in {chrom_size_file}'
+    elif not start < end <= chrom_sizes[size_chrom_name]:
+        error = f'expected start < end <= {chrom_sizes[size_chrom_name]}, the size of {chrom}'
+    elif end - start < MIN_REGION_SPAN:
+        error = f'the region spans {end - start} bp, less than the minimum of {MIN_REGION_SPAN} bp'
+    elif not MIN_REGION_BINS <= num_bins <= MAX_REGION_BINS:
+        error = (f'the window {chrom}:{window_start}-{window_end} covering the region has {num_bins} bins '
+                 f'of {bin_size} bp, outside the allowed {MIN_REGION_BINS} to {MAX_REGION_BINS}. '
+                 f'Change the region or the bin size')
+    else:
+        return chrom, window_start, window_end
+
+    log.error(f'Invalid genomic_location "{genomic_location}": {error}')
+    raise ValueError(f'Invalid genomic_location "{genomic_location}": {error}')
+
 def read_data(
     input_data_file: str,
     chrom_size_file: str,
@@ -366,7 +518,14 @@ def read_data(
     output_dir: str = 'output',
     min_hic_value: int = 1,
     min_bedgraph_value: int = 1,
-    ba_mult: int = 1
+    ba_mult: int = 1,
+    coverage_weighting: str = 'mult',
+    ablation: str = 'None',
+    ablation_hic_10x_rep2: bool = False,
+    fixed_seed: bool = False,
+    genomic_location: str = 'all',
+    gamma: float = None,
+    shapley: bool = False
 ) -> Dict[str, GenomeBinData]:
     """
     Reads all samples that are found in loop_data_dir.
@@ -413,8 +572,21 @@ def read_data(
         Directory to output data
     ba_mult : int
         Multiplicative factor to multiply binding affinity values by
-        This is recommended if there are binding affinity values are less than 1 
+        This is recommended if there are binding affinity values are less than 1
         (i.e. non-integer values between 0 and 1)
+    genomic_location : str
+        'all' (default) for the sliding windows of the whole genome, or a genomic region
+        'chrom:start-end' in bp such as 'chr5:3000000-5000000' (see `parse_genomic_location`).
+        A region is compared as a single window instead: the smallest run of whole bins that
+        covers it, which must hold 3 to 1000 bins, from a region spanning at least 20 kb.
+        The chromosome may be named with or without the 'chr' prefix, in the region and in
+        each input file, and is named 'chr*' in the outputs. `window_size`, `window_stride`
+        and `chroms_to_load` are then ignored. Not implemented for the shuffle ablations
+        or with peak filtering
+    shapley : bool
+        Whether to also build the structure only and binding only graphs of every window
+        that compare(..., shapley=True) needs for the Shapley attribution. Roughly doubles
+        the memory taken by the adjacency matrices. Not implemented with peak filtering
 
     Returns
     -------
@@ -432,6 +604,26 @@ def read_data(
         log.error(f"Data file: {input_data_file} is not a valid file")
         return sample_data_dict
 
+    # Single window instead of the sliding windows of the genome
+    region = parse_genomic_location(genomic_location, chrom_size_file, bin_size)
+    if region is not None:
+        region_chrom, window_start, window_end = region
+        log.info(f'genomic_location "{genomic_location}": comparing the single window '
+                 f'{region_chrom}:{window_start}-{window_end} ({(window_end - window_start) // bin_size} '
+                 f'bins of {bin_size} bp) instead of sliding windows')
+        log.warning('Window scores depend on the size of the window (N x N matrices), so compare the '
+                    'scores of a genomic_location only with scores of the same region and bin_size, '
+                    'not with genome-wide scores')
+
+        if chroms_to_load:
+            log.warning(f'chroms_to_load {chroms_to_load} is ignored for a genomic_location')
+
+        if ablation in ["Shuffle Binding", "Shuffle Structure", "Shuffle Both"]:
+            log.error(f'Ablation "{ablation}" shuffles the windows of a chromosome, which needs more '
+                      f'than the single window of a genomic_location')
+            raise ValueError(f'Ablation "{ablation}" shuffles the windows of a chromosome, which needs more '
+                             f'than the single window of a genomic_location')
+
     # Get input file names
     input_sample_files = []
     num_files = 3
@@ -445,7 +637,37 @@ def read_data(
                 num_files = 4
             input_sample_files.append(sample_files)
 
-    sample_timings = OrderedDict()
+    # Peak filtering changes the default graphs in `preprocess` but not the Shapley variants
+    if shapley and (num_files == 4 or num_peaks is not None):
+        log.error('The Shapley attribution is not implemented together with peak filtering')
+        raise NotImplementedError('The Shapley attribution is not implemented together with peak filtering')
+
+    # Peaks are thresholded by the ratio kept in base_chrom, which a single region does not have
+    if region is not None and (num_files == 4 or num_peaks is not None):
+        log.error('Peak filtering is not implemented for a genomic_location')
+        raise NotImplementedError('Peak filtering is not implemented for a genomic_location')
+
+    # Dict from sample name to an integer for random seed
+    if not fixed_seed:
+        # Variable seed per sample
+        rng_seed_dict = {sample_files[0] : i for i, sample_files in enumerate(input_sample_files)} 
+    else:
+        # Fixed seed per sample
+        rng_seed_dict = {sample_files[0] : 42 for sample_files in input_sample_files}
+
+    if ablation in ["Shuffle Binding", "Shuffle Structure", "Shuffle Both"]:
+        # For this ablation, we want variable shuffling for each sample
+        rng_seed_dict = {sample_files[0] : i for i, sample_files in enumerate(input_sample_files)}
+
+        # We want to shuffle all samples
+        # It should *suffice* to shuffle just the "left" of a pair
+        # but it is suitable to also shuffle both of a pair (i.e. both)
+        to_shuffle = True
+    else:
+        to_shuffle = False
+
+
+    sample_timings = OrderedDict() 
     for sample_files in input_sample_files:
         sample_start_time = time.time()
 
@@ -474,15 +696,19 @@ def read_data(
             # peak_dict = generate_peak_file(bin_size, chrom_size_file)
             peak_dict = construct_empty_peak_dict(chrom_size_file)
             from_peak_file = False
+
+        if to_shuffle:
+            log.info(f'Shuffling \'{ablation}\' of {sample_name} ...')
         
         gld = GenomeBinData(chrom_size_file, bedgraph_file, chrom_structure_file,
                             window_size, window_stride, normalization,
-                            peak_dict=peak_dict, from_peak_file=from_peak_file, 
+                            peak_dict=peak_dict, from_peak_file=from_peak_file,
                             base_chrom=base_chrom, num_peaks=num_peaks,
                             chroms_to_load=chroms_to_load, bin_size=bin_size,
-                            min_hic_value=min_hic_value, min_bedgraph_value=min_bedgraph_value, 
-                            ba_mult=ba_mult)
-
+                            min_hic_value=min_hic_value, min_bedgraph_value=min_bedgraph_value,
+                            rng_seed=rng_seed_dict[sample_name], ba_mult=ba_mult, output_dir=output_dir, coverage_weighting=coverage_weighting, 
+                            ablation=ablation, ablation_hic_10x_rep2=ablation_hic_10x_rep2, to_shuffle=to_shuffle, gamma=gamma,
+                            shapley=shapley, region=region)
 
         sample_data_dict[sample_name] = gld
         sample_timings[sample_name] = time.time() - sample_start_time

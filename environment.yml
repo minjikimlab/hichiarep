@@ -6,6 +6,7 @@ dependencies:
   - python=3.10
   - numpy>=2.2,<2.3
   - scipy>=1.15,<1.16
+  - threadpoolctl # Pins BLAS to one thread inside the worker pool
   - matplotlib>=3.10,<3.11
   - click
   - pybedgraph>=0.5

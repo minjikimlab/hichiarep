@@ -1,4 +1,5 @@
 import sys
+import zlib
 from math import ceil
 import numpy as np
 import scipy.stats as sp
@@ -7,16 +8,57 @@ from scipy.sparse.linalg import expm_multiply
 from scipy.sparse import diags, eye
 from scipy.stats import spearmanr
 from scipy.signal import convolve
+from scipy.sparse.csgraph import connected_components
 import time
 import logging
 from typing import Dict, Tuple, Union
 import os
 import multiprocessing as mp
 
-# from .util import * # Need for `emd` but is now deprecated
+try:
+    from threadpoolctl import threadpool_limits
+except ImportError: # Optional: should still work without this
+    threadpool_limits = None
+
+# from .util import * # `emd` deprecated
 
 log = logging.getLogger()
 log_bin = logging.getLogger('bin')
+
+# Keep
+_worker_thread_limit = None
+_warned_no_threadpoolctl = False
+
+
+def _limit_blas_threads_in_worker():
+    """
+    Pool initializer: pin the BLAS / OpenMP thread pools of this worker to one thread
+
+    Every forked worker inherits numpy's BLAS (OpenBLAS by default), which spawns one
+    thread per CPU. With `num_cores` workers this oversubscribes the CPUs `num_cores`
+    fold, and the busy-waiting BLAS threads make the dense NxN matrix powers of the
+    random walk several times slower. The pool already parallelizes across windows,
+    so one BLAS thread per worker is the right configuration.
+    """
+    global _worker_thread_limit
+    if threadpool_limits is not None:
+        _worker_thread_limit = threadpool_limits(limits=1)
+
+
+def _make_pool(num_cores):
+    """
+    A multiprocessing pool of `num_cores` workers, each with single-threaded BLAS
+
+    Warns once if `threadpoolctl` is missing, in which case the caller should set
+    OPENBLAS_NUM_THREADS=1 (and OMP_NUM_THREADS=1) in the environment instead.
+    """
+    global _warned_no_threadpoolctl
+    if threadpool_limits is None and not _warned_no_threadpoolctl:
+        log.warning('threadpoolctl is not installed, so BLAS threads are not limited inside '
+                    'the worker pool. Set OPENBLAS_NUM_THREADS=1 and OMP_NUM_THREADS=1 before '
+                    'running to avoid thread oversubscription')
+        _warned_no_threadpoolctl = True
+    return mp.Pool(processes=num_cores, initializer=_limit_blas_threads_in_worker)
 
 PEAK_MAX_VALUE_INDEX = 3
 MAX_USHRT = 65535
@@ -284,10 +326,45 @@ def pmf(x):
     x /= x.sum()
     return x
 
-def random_walk(A, p, tol=1):
-    """ Helper function for GSP methods """
-    deg = np.asarray(A.sum(axis=1)).ravel()
-    deg_inv = np.zeros_like(deg, dtype=A.dtype)
+def random_walk(A, p, tol=1, report_conv_it=False, b=None, conv_tol=1e-6, max_iter=1000):
+    """
+    Helper function for GSP methods
+
+    Builds the (column-stochastic) transition matrix P from A and returns P^p
+
+    Optionally reports the iteration at which the walk converges, i.e. the
+    smallest k with
+
+        ||A_{k+1} - A_k||_F / ||A_k||_F < conv_tol,   A_k = P^k
+
+    Parameters
+    ----------
+    A : np.ndarray
+        Dense adjacency matrix
+    p : int
+        Power to raise the transition matrix to
+    tol : float
+        Degree below which a node is considered isolated
+    report_conv_it : bool
+        Whether to also compute the converged iteration. This walks the powers
+        of P one at a time and is therefore only done when requested
+    conv_tol : float
+        Relative Frobenius tolerance for the convergence criterion
+    max_iter : int
+        Maximum k to try before giving up on convergence
+    b : np.ndarray
+        Initial vector for the random walk to compute the convergence criterion
+
+    Returns
+    -------
+    K : np.ndarray
+        P^p
+    converged_it : int or None
+        The converged iteration k. None if `report_conv_it` is False or if the
+        criterion was not met within `max_iter` iterations
+    """
+    deg = np.asarray(A.sum(axis=0)).ravel()
+    deg_inv = np.zeros_like(deg, dtype=float) # Changed from A.dtype to float
     nonzero = deg > tol
     deg_inv[nonzero] = 1.0 / deg[nonzero]
     P = A * deg_inv[None, :]
@@ -298,7 +375,62 @@ def random_walk(A, p, tol=1):
     # Use np.diag_indices or explicit indexing for diagonal
     isolated_indices = np.where(isolated_nodes)[0]
     P[isolated_indices, isolated_indices] = 1.0
-    return np.linalg.matrix_power(P, p)
+
+    K = np.linalg.matrix_power(P, p)
+
+    converged_it = None
+    predicted_it = None
+    if report_conv_it:
+
+        # The above computes the convergent criteria for the matrix, which is correct
+        # However, we can also compute the convergent criteria for the vector which may be faster
+        if b is None:
+            # Raise error
+            print("Error: b must be provided when report_conv_it is True")
+            raise ValueError("b must be provided when report_conv_it is True")
+
+        n_comp, _ = connected_components(P != 0, directed=False)
+
+        ev = np.linalg.eigvals(P)
+        ev = ev[np.argsort(-np.abs(ev))]
+        unit, tail = ev[:n_comp], ev[n_comp:]
+
+        if not np.allclose(np.abs(unit), 1.0, atol=1e-5):
+            raise RuntimeError(
+                f"expected {n_comp} unit eigenvalues, got moduli "
+                f"{np.abs(unit)}; P may not be column-stochastic"
+            )
+        
+
+        # Capture periodicity by checking if any eigenvalues are on the unit circle but not equal to 1
+        # ev = np.linalg.eigvals(P)
+        # on_circle = np.abs(np.abs(ev) - 1.0) < 1e-8
+        on_circle = (np.abs(np.abs(tail) - 1.0) < 1e-6) & (np.abs(tail - 1.0) > 1e-6)
+
+        if np.any(on_circle):
+            converged_it = -1
+            predicted_it = -1
+        else:
+            # Compute the predicted convergence iteration based on the second largest eigenvalue
+            lambda2 = np.abs(tail[0]) if tail.size else 0.0
+
+            if lambda2 <= 0:
+                predicted_it = 1 # Converged after 1 step
+            else:
+                predicted_it = np.round(np.log(conv_tol) / np.log(lambda2)).astype(int)
+                if predicted_it < 0:
+                    # Invalid predicted iteration, set to max_iter
+                    predicted_it = None
+                
+            b_k = P @ b  
+            for k in range(1, max_iter + 1):
+                b_next = P @ b_k
+                if np.linalg.norm(b_next - b_k) / np.linalg.norm(b_k) < conv_tol:
+                    converged_it = k
+                    break
+                b_k = b_next
+
+    return K, converged_it, predicted_it
 
 
 
@@ -315,37 +447,42 @@ def compare_signals(a, b, compare_method):
     else:
         raise ValueError(f'Unknown compare method: {compare_method}')
 
-def subsample(A1 : np.ndarray, A2 : np.ndarray, B1 : np.ndarray, B2: np.ndarray, p=1.0):
+def subsample(A1 : np.ndarray, A2 : np.ndarray, B1 : np.ndarray, B2: np.ndarray, p=1.0, seed=None):
     '''
     Subsamples adjacency matrices A1, A2 and binding intensities B1, B2
-    
+
     A1, A2: Input adjacency matrices with integer elements.
-    B1, B2: Input binding intensities with integer elements. 
-    p: After initial subsampling, further subsample to this level. 
+    B1, B2: Input binding intensities with integer elements.
+    p: After initial subsampling, further subsample to this level.
+    seed: Seed of the binomial draws, anything np.random.default_rng accepts.
+          Fresh entropy if None. A seeded generator per window, rather than numpy's
+          global one, keeps the draws of the forked pool workers independent
 
     Returns: Updated A1, A2, B1, B2
 
     Author: Joseph Jackson
     '''
+    rng = np.random.default_rng(seed)
+
     def subsample_pair(A : np.ndarray, B : np.ndarray):
         depthA, depthB = A.sum(), B.sum()
-            
+
         if depthA == 0 or depthB == 0:
             return A, B
 
         if depthA > depthB:
-            A = np.random.binomial(A, depthB / depthA)
+            A = rng.binomial(A, depthB / depthA)
         else:
-            B = np.random.binomial(B, depthA / depthB)
+            B = rng.binomial(B, depthA / depthB)
         return A, B
-    
+
     A1_sub, A2_sub = subsample_pair(np.rint(A1).astype(np.int64), np.rint(A2).astype(np.int64))
     B1_sub, B2_sub = subsample_pair(np.rint(B1).astype(np.int64), np.rint(B2).astype(np.int64))
     if (p < 1.0):
-        A1_sub = np.random.binomial(A1_sub, p)
-        A2_sub = np.random.binomial(A2_sub, p)
-        B1_sub = np.random.binomial(B1_sub, p)
-        B2_sub = np.random.binomial(B2_sub, p)
+        A1_sub = rng.binomial(A1_sub, p)
+        A2_sub = rng.binomial(A2_sub, p)
+        B1_sub = rng.binomial(B1_sub, p)
+        B2_sub = rng.binomial(B2_sub, p)
 
     # Preserve data types
     A1_sub = A1_sub.astype(A1.dtype)
@@ -356,21 +493,115 @@ def subsample(A1 : np.ndarray, A2 : np.ndarray, B1 : np.ndarray, B2: np.ndarray,
     return A1_sub, A2_sub, B1_sub, B2_sub
 
 
+def dead_bins(A, tol=0.0):
+    """
+    Helper function for GSP methods
+
+    Boolean mask of the bins whose column of the (unblurred) coverage weighted A sums to <= tol
+
+    A is symmetric, so this is also the row-sum test. Evaluated on the weighted matrix because
+    that is what the random walk sees: with 'mult_power' weighting a bin without binding has a
+    zero row even if it has raw contacts, and it is dead for the walk either way.
+    A can be dense or sparse
+    """
+    return np.asarray(A.sum(axis=0)).ravel() <= tol
+
+
+def live_mask(A1, A2, live_bin_rule='either', tol=0.0):
+    """
+    Helper function for GSP methods
+
+    Bins kept for the comparison of one window pair (True = kept)
+
+    A dead bin is an absorbing node of the walk and ends up as a near-zero entry of the
+    diffused PMF. A block of such bins shared by both sides is a set of concordant bottom ranks
+    that inflates the Spearman score of unrelated samples; a block present on only one side is a
+    set of maximally discordant ranks that collapses the score of replicates.
+
+    live_bin_rule : str
+        'either': drop bins dead on either side (keep the intersection of the live bins)
+        'both'  : drop bins dead on both sides only (keep the union of the live bins)
+        'none'  : keep every bin
+    """
+    d1 = dead_bins(A1, tol)
+    d2 = dead_bins(A2, tol)
+    if live_bin_rule == 'none':
+        return np.ones(d1.shape, dtype=bool)
+    if live_bin_rule == 'either':
+        return ~(d1 | d2)
+    if live_bin_rule == 'both':
+        return ~(d1 & d2)
+    raise ValueError(f'Unknown live bin rule: {live_bin_rule}')
+
+
 def _random_walk_gsp_worker(args):
-    """ Computes random walk GSP """
-    A1, x1, A2, x2, p, compare_method, cross, ssp = args
+    """
+    Computes random walk GSP
+
+    Returns
+    -------
+    score : float
+        The comparison value for this window
+    converged_it : np.ndarray
+        Length 4 array holding the iteration at which the walk on each of the
+        two graphs converged. An entry is np.nan if that walk did not converge,
+        if the window was skipped, or if `report_conv_it` is False
+    n_live : int
+        Number of bins kept by the live bin mask (see `live_mask`), returned
+        with every early exit too. The window weight is n_live / N
+    W_S, W_B : float
+        Scores of the structure only (binding affinity replaced by ones) and the
+        binding only (structure replaced by the identity) variants of the window pair,
+        on the same live bins as `score`. np.nan unless `shapley_graphs` is given
+    """
+    A1, x1, A2, x2, p, compare_method, cross, ssp, ssp_seed, report_conv_it, live_bin_rule, min_live_bins, shapley_graphs = args
 
     if ssp is not None:
         A1 = A1.toarray()
         A2 = A2.toarray()
-        A1, A2, x1, x2 = subsample(A1, A2, x1, x2, p=ssp)
+        A1, A2, x1, x2 = subsample(A1, A2, x1, x2, p=ssp, seed=ssp_seed)
 
-    # Compute skip window here
+    # Windows are no longer skipped for sparse binding affinity, dead bins are removed below instead
     N = x1.shape[0]
-    node_sparse_1 = (np.sum(x1 < 1) / N) > 0.5
-    node_sparse_2 = (np.sum(x2 < 1) / N) > 0.5
-    skip_window = node_sparse_1 | node_sparse_2
-    
+    # node_sparse_1 = (np.sum(x1 < 1) / N) > 0.5
+    # node_sparse_2 = (np.sum(x2 < 1) / N) > 0.5
+    # skip_window = node_sparse_1 | node_sparse_2
+
+    # Live bins, from the coverage weighted A before the blur (the matrix that is walked)
+    keep = live_mask(A1, A2, live_bin_rule)
+
+    score, converged_it, n_live = _random_walk_score(A1, x1, A2, x2, keep, p, compare_method, cross, ssp,
+                                                     report_conv_it, min_live_bins)
+    if shapley_graphs is None:
+        return score, converged_it, n_live, np.nan, np.nan
+
+    # Shapley attribution: the same walk on the two ablated variants of the window pair, on the
+    # live bins of the default graphs so that the three scores compare the same bins
+    A1_S, A2_S, A1_B, A2_B = shapley_graphs
+    ones = np.ones_like(x1)
+    W_S, _, _ = _random_walk_score(A1_S, ones, A2_S, ones, keep, p, compare_method, cross, None,
+                                   False, min_live_bins)
+    W_B, _, _ = _random_walk_score(A1_B, x1, A2_B, x2, keep, p, compare_method, cross, None,
+                                   False, min_live_bins)
+    return score, converged_it, n_live, W_S, W_B
+
+
+def _random_walk_score(A1, x1, A2, x2, keep, p, compare_method, cross, ssp, report_conv_it, min_live_bins):
+    """
+    Helper function for GSP methods
+
+    Random walk score of one window pair on the bins in `keep` (see `live_mask`).
+    The skip rules are evaluated on the full window, then the rows / columns of A and
+    the entries of x outside `keep` are removed from both sides. The inputs are not modified
+
+    Returns
+    -------
+    score, converged_it, n_live : see `_random_walk_gsp_worker`
+    """
+    # Returned alongside every early exit below
+    no_conv = np.full(4, np.nan)
+    n_live = int(keep.sum())
+
     sum_x1 = np.sum(x1)
     sum_x2 = np.sum(x2)
     max_A1 = np.max(A1)
@@ -379,22 +610,32 @@ def _random_walk_gsp_worker(args):
     both_zero = (np.isclose(sum_x1, 0) and np.isclose(sum_x2, 0)) or (np.isclose(max_A1, 0) and np.isclose(max_A2, 0))
     one_zero = (np.isclose(sum_x1, 0) or np.isclose(sum_x2, 0)) or (np.isclose(max_A1, 0) or np.isclose(max_A2, 0))
     if both_zero:
-        return np.nan
+        return np.nan, no_conv, n_live
     if one_zero:
         if compare_method == "spearman":
-            return 0.0
+            return 0.0, no_conv, n_live
         elif compare_method == "jsd":
-            return 1.0 
-        
+            return 1.0, no_conv, n_live
+
     # Skip window MUST be here because there are some more special cases
     # that the `skip_window` check did not consider first
-    if skip_window:
-        return np.nan
-    
+    # if skip_window:
+    #     return np.nan, no_conv
+
+    # Windows with too few live bins are skipped
+    if n_live < min_live_bins:
+        return np.nan, no_conv, n_live
+
     # Only make into dense if necessary
     if ssp is None:
         A1 = A1.toarray()
         A2 = A2.toarray()
+
+    # Live bins: drop the dead rows / columns and signal entries from both sides
+    A1 = np.ascontiguousarray(A1[np.ix_(keep, keep)])
+    A2 = np.ascontiguousarray(A2[np.ix_(keep, keep)])
+    x1 = x1[keep]
+    x2 = x2[keep]
 
     # Blur
     np.clip(apply_mean_filter(A1, ks=3), 0, None, out=A1)
@@ -405,13 +646,34 @@ def _random_walk_gsp_worker(args):
     # A1 += I
     # A2 += I
 
-    p = int(p)
-    K1 = random_walk(A1, p)
-    K2 = random_walk(A2, p)
-
     # Preprocess input signals to be PMFs
     x1 = pmf(x1)
     x2 = pmf(x2)
+
+    p = int(p)
+    
+    if p == 0:
+        K1 = np.eye(A1.shape[0], dtype=A1.dtype)
+        K2 = np.eye(A2.shape[0], dtype=A2.dtype)
+        conv_it_1 = None
+        conv_it_2 = None
+        pred_it_1 = None
+        pred_it_2 = None
+    else:
+        K1, conv_it_1, pred_it_1 = random_walk(A1, p, report_conv_it=report_conv_it, b=x1)
+        K2, conv_it_2, pred_it_2 = random_walk(A2, p, report_conv_it=report_conv_it, b=x2)
+
+    # A walk that never met the criterion within the budget stays nan
+    # The first two entries are for the convergence iterations, the last two are for the predicted iterations
+    converged_it = no_conv.copy()
+    if conv_it_1 is not None:
+        converged_it[0] = conv_it_1
+    if conv_it_2 is not None:
+        converged_it[1] = conv_it_2
+    if pred_it_1 is not None:
+        converged_it[2] = pred_it_1
+    if pred_it_2 is not None:
+        converged_it[3] = pred_it_2
 
     # Forward pass i.e. K @ x
     x11 = K1 @ x1
@@ -432,12 +694,12 @@ def _random_walk_gsp_worker(args):
         val_a = compare_signals(x11, x12, compare_method)
         val_b = compare_signals(x22, x21, compare_method)
 
-        return 0.5 * (val_a + val_b)
+        return 0.5 * (val_a + val_b), converged_it, n_live
 
-    # Direct 
-    return compare_signals(x11, x22, compare_method)
+    # Direct
+    return compare_signals(x11, x22, compare_method), converged_it, n_live
 
-    
+
 def laplacian_sparse(A, laplacian_type):
     """ 
     Helper function for GSP methods
@@ -517,12 +779,12 @@ def construct_diffusion_kernel(L, t):
 
 def _diffusion_gsp_worker(args):
     """ Computes diffusion GSP """
-    A1, x1, A2, x2, t, compare_method, cross, ssp = args
+    A1, x1, A2, x2, t, compare_method, cross, ssp, ssp_seed = args
 
     if ssp is not None:
         A1 = A1.toarray()
         A2 = A2.toarray()
-        A1, A2, x1, x2 = subsample(A1, A2, x1, x2, p=ssp)
+        A1, A2, x1, x2 = subsample(A1, A2, x1, x2, p=ssp, seed=ssp_seed)
 
     # Compute skip window here
     N = x1.shape[0]
@@ -737,7 +999,8 @@ class ChromBinData:
     window_indices : np.ndarray
         The start and end indices of each window in bin units
     window_locations : np.ndarray
-        The start and end locations of each window in base pairs
+        The start and end locations of each window in base pairs.
+        A single window if the chromosome was loaded for a genomic region
     adjacency_matrices : list
         A list of NxN COO sparse adjacency matrices for each window.
         N is the number of bins per window.
@@ -745,6 +1008,10 @@ class ChromBinData:
         A MxN array of binding affinity for the chromosome
         M is the number of windows
         N is the number of bins per window
+    adjacency_matrices_S, adjacency_matrices_B : list
+        Coverage weighted adjacency matrices of the structure only (binding affinity
+        replaced by ones) and binding only (structure replaced by the identity) variants
+        of each window, for the Shapley attribution. None unless loaded with shapley=True
     """
 
     def __init__(
@@ -754,7 +1021,8 @@ class ChromBinData:
             sample_name: str,
             bin_size: int,
             window_size: int,
-            window_stride: int
+            window_stride: int,
+            region: Tuple[int, int] = None
     ):
         # Parameters
         self.name = chrom_name
@@ -763,9 +1031,16 @@ class ChromBinData:
         self.bin_size = bin_size
 
         # Data Attributes
-        self.window_indices, self.window_locations = construct_windows(chrom_size, window_size, window_stride, bin_size)
+        if region is None:
+            self.window_indices, self.window_locations = construct_windows(chrom_size, window_size, window_stride, bin_size)
+        else:
+            # A single window over the bin aligned region (start, end) instead of the sliding windows
+            self.window_locations = np.array([region])
+            self.window_indices = self.window_locations // bin_size
         self.adjacency_matrices = None # Populated later on
         self.node_weights = None # Populated later on
+        self.adjacency_matrices_S = None # Populated later on (shapley=True only)
+        self.adjacency_matrices_B = None # Populated later on (shapley=True only)
 
     def finish_init(self):
         """
@@ -998,7 +1273,7 @@ class ChromBinData:
                 (C1[i], C2[i], p[i], q[i], alpha, M_single, skip_window[i], N, scale_cost, mass)
                 for i in range(M)
             ]
-            with mp.Pool(processes=num_cores) as pool:
+            with _make_pool(num_cores) as pool:
                 distances = np.array(pool.map(_fgw_distance_worker, tasks))
         else:
             # Fallback to single core 
@@ -1084,7 +1359,8 @@ class ChromBinData:
         return distances, window_weights
     
 
-    def gsp_batch(self, o_chrom, kernel_type, mu, compare_method, cross, ssp, num_cores=1):
+    def gsp_batch(self, o_chrom, kernel_type, mu, compare_method, cross, ssp, num_cores=1,
+                  report_conv_it=False, live_bin_rule='either', min_live_bins=10, shapley=False):
         """
         Computes the GSP distances on batches of graphs.
         Uses sparse matrices directly for efficiency with expm_multiply.
@@ -1106,10 +1382,39 @@ class ChromBinData:
         ssp : float
             Subsample percentage in [0, 1]. If None, then no subsampling is done.
             If specified as a float between 0 and 1, then that initial subsampling is done
-            to ensure the read depth is identical between any two pairs. 
+            to ensure the read depth is identical between any two pairs.
             Additional subsampling is done that is a proportion of this common read depth.
+            Window i is subsampled with the seed (crc32 of the sample and chromosome names, i)
         num_cores : int
             Number of cores to use
+        report_conv_it : bool
+            Whether to also report the iteration at which the random walk converged
+            for each window. Only applies to kernel_type == "random_walk"
+        live_bin_rule : str
+            Which dead bins to drop from a window pair before the random walk:
+            'either', 'both' or 'none' (see `live_mask`).
+            Only applies to kernel_type == "random_walk"
+        min_live_bins : int
+            Windows with fewer live bins are skipped (nan).
+            Only applies to kernel_type == "random_walk"
+        shapley : bool
+            Whether to also score the structure only and binding only variants of every
+            window pair (`adjacency_matrices_S`, `adjacency_matrices_B`) for the Shapley
+            attribution. Only applies to kernel_type == "random_walk"
+
+        Returns
+        -------
+        distances : np.ndarray
+            (M,) array of comparison values
+        window_weights : np.ndarray
+            (M,) array of window weights. For kernel_type == "random_walk" this is
+            beta = n_live / N, the fraction of bins kept by the live bin mask.
+            Otherwise all ones
+        converged_it : np.ndarray
+            (M, 4) array holding the converged iteration of the random walk on
+            each of the two samples. All nan if not reported/applicable
+        shapley_scores : np.ndarray
+            (M, 2) array holding W_S and W_B of every window. All nan if `shapley` is False
         """
         # We use the sparse matrices directly
         adj_list1 = self.adjacency_matrices
@@ -1122,36 +1427,70 @@ class ChromBinData:
         M = len(adj_list1) # number of windows
         N = weights1.shape[1] # number of bins per window
 
+        if kernel_type == "random_walk" and N < min_live_bins:
+            log.warning(f'{self.name}: windows have {N} bins, fewer than min_live_bins={min_live_bins}, '
+                        f'so every window with data on both sides is skipped (nan)')
+
         # BA is not yet normalized, so we deem BA to be "0" if count is less than 1
         # If more than 50% of the nodes in the window are "0", we skip the window
         # node_sparse_1 = (np.sum(weights1 < 1, axis=1) / N) > 0.5
         # node_sparse_2 = (np.sum(weights2 < 1, axis=1) / N) > 0.5
         # skip_window = node_sparse_1 | node_sparse_2
 
+        # Structure only and binding only graphs of both samples, for the Shapley attribution
+        if shapley:
+            if self.adjacency_matrices_S is None or o_chrom.adjacency_matrices_S is None:
+                log.error('The Shapley attribution needs the samples to be loaded with shapley=True')
+                raise ValueError('The Shapley attribution needs the samples to be loaded with shapley=True')
+            shapley_graphs = [(self.adjacency_matrices_S[i], o_chrom.adjacency_matrices_S[i],
+                               self.adjacency_matrices_B[i], o_chrom.adjacency_matrices_B[i]) for i in range(M)]
+        else:
+            shapley_graphs = [None] * M
+
+        # Subsampling seed of every window (ssp), fixed by the pair, the chromosome and the window so the
+        # draws neither depend on the pool worker that scores the window nor repeat across workers
+        pair_seed = zlib.crc32(f'{self.sample_name}\t{o_chrom.sample_name}\t{self.name}'.encode())
+
         tasks = [
-            (adj_list1[i], weights1[i].copy(), adj_list2[i], weights2[i].copy(), mu, compare_method, cross, ssp)
+            (adj_list1[i], weights1[i].copy(), adj_list2[i], weights2[i].copy(), mu, compare_method, cross, ssp,
+             (pair_seed, i), report_conv_it, live_bin_rule, min_live_bins, shapley_graphs[i])
             for i in range(M)
         ]
 
+        if kernel_type == "diffusion":
+            # The diffusion worker takes the task tuple without the reporting flag, the live bin and the Shapley arguments
+            tasks = [t[:-4] for t in tasks]
+        elif kernel_type != "random_walk":
+            raise ValueError(f'Unknown kernel type: {kernel_type}')
+
+        # Only the random walk worker reports the converged iteration
+        # The first two entries are for the convergence iterations, the last two are for the predicted iterations
+        converged_it = np.full((M, 4), np.nan)
+
         if num_cores > 1:
-            with mp.Pool(processes=num_cores) as pool:
+            with _make_pool(num_cores) as pool:
                 if kernel_type == "diffusion":
                     distances = np.array(pool.map(_diffusion_gsp_worker, tasks))
-                elif kernel_type == "random_walk":
-                    distances = np.array(pool.map(_random_walk_gsp_worker, tasks))
                 else:
-                    raise ValueError(f'Unknown kernel type: {kernel_type}')
+                    results = pool.map(_random_walk_gsp_worker, tasks)
         else:
             if kernel_type == "diffusion":
                 distances = np.array([_diffusion_gsp_worker(t) for t in tasks])
-            elif kernel_type == "random_walk":
-                distances = np.array([_random_walk_gsp_worker(t) for t in tasks])
             else:
-                raise ValueError(f'Unknown kernel type: {kernel_type}')
+                results = [_random_walk_gsp_worker(t) for t in tasks]
 
         window_weights = np.ones(M)
+        shapley_scores = np.full((M, 2), np.nan)
 
-        return distances, window_weights
+        if kernel_type == "random_walk":
+            distances = np.array([r[0] for r in results])
+            converged_it = np.array([r[1] for r in results], dtype=float).reshape(M, 4)
+            # Window weight beta = n_live / N, the fraction of bins kept by the live bin mask
+            window_weights = np.array([r[2] for r in results], dtype=float) / N
+            # W_S, W_B (nan unless `shapley`)
+            shapley_scores = np.array([r[3:5] for r in results], dtype=float).reshape(M, 2)
+
+        return distances, window_weights, converged_it, shapley_scores
     
     def wasserstein_batch(self, o_chrom, feat, weight, num_cores=1):
         """
@@ -1178,7 +1517,7 @@ class ChromBinData:
         ]
 
         if num_cores > 1:
-            with mp.Pool(processes=num_cores) as pool:
+            with _make_pool(num_cores) as pool:
                 distances = np.array(pool.map(_wasserstein_worker, tasks))
         else:
             distances = np.array([_wasserstein_worker(t) for t in tasks])
@@ -1216,10 +1555,10 @@ class ChromBinData:
 
         if num_cores > 1:
             if method == "emd":
-                with mp.Pool(processes=num_cores) as pool:
+                with _make_pool(num_cores) as pool:
                     distances = np.array(pool.map(_emd_worker, tasks))
             else: 
-                with mp.Pool(processes=num_cores) as pool:
+                with _make_pool(num_cores) as pool:
                     distances = np.array(pool.map(_jsd_worker, tasks))
         else:
             if method == "emd":
@@ -1248,7 +1587,11 @@ class ChromBinData:
         feat: str = 'index_BA',
         weight: str = 'uniform',
         ssp: float = None,
-        num_cores: int = 1
+        num_cores: int = 1,
+        report_conv_it: bool = False,
+        live_bin_rule: str = 'either',
+        min_live_bins: int = 10,
+        shapley: bool = False
     ):
         """
         Compares this chromosome with another chromosome using the specified method
@@ -1292,8 +1635,19 @@ class ChromBinData:
         ssp : float
             Subsample percentage in [0, 1]. If None, then no subsampling is done.
             If specified as a float between 0 and 1, then that initial subsampling is done
-            to ensure the read depth is identical between any two pairs. 
+            to ensure the read depth is identical between any two pairs.
             Additional subsampling is done that is a proportion of this common read depth.
+        report_conv_it : bool
+            Whether to also report the converged iteration of the random walk for
+            each window (only applies to method == 'random_walk')
+        live_bin_rule : str
+            Which dead bins to drop from a window pair before the random walk:
+            'either', 'both' or 'none' (only applies to method == 'random_walk')
+        min_live_bins : int
+            Windows with fewer live bins are skipped (only applies to method == 'random_walk')
+        shapley : bool
+            Whether to also compute W_S and W_B of every window for the Shapley attribution
+            (only applies to method == 'random_walk', see `gsp_batch`)
 
         Returns
         -------
@@ -1301,12 +1655,20 @@ class ChromBinData:
             A tuple containing:
             - distances : np.ndarray
                 Array of distances for each window
-            - window_weights : np.ndarray (deprecated)
-                Array of weights for each window
+            - window_weights : np.ndarray
+                Array of weights for each window. For method == 'random_walk' this is
+                beta = n_live / N, the fraction of bins kept by the live bin mask
             - max_graph : np.ndarray (deprecated)
                 Array of maximum graph values for each window in this chromosome
             - o_max_graph : np.ndarray (deprecated)
                 Array of maximum graph values for each window in the other chromosome
+            - converged_it : np.ndarray
+                (M, 4) array holding the converged iteration of the random walk on
+                this chromosome and on the other chromosome, for each window.
+                All nan when not reported/applicable
+            - shapley_scores : np.ndarray
+                (M, 2) array holding W_S and W_B of every window.
+                All nan when not computed/applicable
         """
 
         # Output graph variables if chr1
@@ -1343,61 +1705,65 @@ class ChromBinData:
             # Used for diagnostics
             max_graph = np.max(np.maximum(adjacency_matrices, 0), axis=(1, 2))
             o_max_graph = np.max(np.maximum(o_adjacency_matrices, 0), axis=(1, 2))
-            result = (distances, window_weights, max_graph, o_max_graph)
+            result = (distances, window_weights, max_graph, o_max_graph,
+                      np.full((len(distances), 4), np.nan), np.full((len(distances), 2), np.nan))
 
         elif method in ["diffusion", "random_walk"]:
 
-            distances, window_weights = self.gsp_batch(o_chrom, kernel_type=method, mu=mu, 
+            distances, window_weights, converged_it, shapley_scores = self.gsp_batch(o_chrom, kernel_type=method, mu=mu,
                                                        compare_method=compare_method, cross=cross, ssp=ssp,
-                                                       num_cores=num_cores)
+                                                       num_cores=num_cores, report_conv_it=report_conv_it,
+                                                       live_bin_rule=live_bin_rule, min_live_bins=min_live_bins,
+                                                       shapley=shapley)
 
-            output_graph(self.adjacency_matrices, self.node_weights, 
+            output_graph(self.adjacency_matrices, self.node_weights,
                          parent_dir, self.name, self.sample_name, do_output_graph, sparse=True)
-            output_graph(o_chrom.adjacency_matrices, o_chrom.node_weights, 
+            output_graph(o_chrom.adjacency_matrices, o_chrom.node_weights,
                          parent_dir, o_chrom.name, o_chrom.sample_name, do_output_graph, sparse=True)
 
             # For DW, we don't have max_graphs in the same sense as FGW
             # Lets return array of same shape of nans
             nans = np.full_like(distances, np.nan)
-            result = (distances, window_weights, nans, nans)
+            result = (distances, window_weights, nans, nans, converged_it, shapley_scores)
 
         elif method == "w":
 
             distances, window_weights = self.wasserstein_batch(o_chrom, feat=feat, weight=weight, num_cores=num_cores)
 
-            output_graph(self.adjacency_matrices, self.node_weights, 
+            output_graph(self.adjacency_matrices, self.node_weights,
                          parent_dir, self.name, self.sample_name, do_output_graph, sparse=True)
-            output_graph(o_chrom.adjacency_matrices, o_chrom.node_weights, 
+            output_graph(o_chrom.adjacency_matrices, o_chrom.node_weights,
                          parent_dir, o_chrom.name, o_chrom.sample_name, do_output_graph, sparse=True)
 
             nans = np.full_like(distances, np.nan)
-            result = (distances, window_weights, nans, nans)
+            result = (distances, window_weights, nans, nans, np.full((len(distances), 4), np.nan),
+                      np.full((len(distances), 2), np.nan))
 
         elif method == "JSD":
             # Apply the old JSD distance function
             distances, window_weights = self.emd_jsd_batch(o_chrom, method="jsd", num_cores=num_cores)
 
-            output_graph(self.adjacency_matrices, self.node_weights, 
+            output_graph(self.adjacency_matrices, self.node_weights,
                          parent_dir, self.name, self.sample_name, do_output_graph, sparse=True)
-            output_graph(o_chrom.adjacency_matrices, o_chrom.node_weights, 
+            output_graph(o_chrom.adjacency_matrices, o_chrom.node_weights,
                          parent_dir, o_chrom.name, o_chrom.sample_name, do_output_graph, sparse=True)
 
             nans = np.full_like(distances, np.nan)
-            result = (distances, window_weights, nans, nans)
+            result = (distances, window_weights, nans, nans, np.full((len(distances), 4), np.nan),
+                      np.full((len(distances), 2), np.nan))
 
         elif method == "EMD":
             # Apply the old EMD distance function
             distances, window_weights = self.emd_jsd_batch(o_chrom, method="emd", num_cores=num_cores)
 
-            output_graph(self.adjacency_matrices, self.node_weights, 
+            output_graph(self.adjacency_matrices, self.node_weights,
                          parent_dir, self.name, self.sample_name, do_output_graph, sparse=True)
-            output_graph(o_chrom.adjacency_matrices, o_chrom.node_weights, 
+            output_graph(o_chrom.adjacency_matrices, o_chrom.node_weights,
                          parent_dir, o_chrom.name, o_chrom.sample_name, do_output_graph, sparse=True)
 
             nans = np.full_like(distances, np.nan)
-            result = (distances, window_weights, nans, nans)
-
-        
+            result = (distances, window_weights, nans, nans, np.full((len(distances), 4), np.nan),
+                      np.full((len(distances), 2), np.nan))
 
         return result
 

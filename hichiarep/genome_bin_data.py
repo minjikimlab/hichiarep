@@ -1,10 +1,12 @@
 import numpy as np
 import os
+import re
 import logging
-# import math
+import math
+import tempfile
 from pyBedGraph import BedGraph
 import hicstraw
-from typing import Dict, List, Union
+from typing import Dict, List, Tuple, Union
 from scipy.sparse import coo_matrix
 import matplotlib.pyplot as plt
 from matplotlib.ticker import EngFormatter, FuncFormatter
@@ -17,12 +19,83 @@ log = logging.getLogger()
 CHROMS_TO_IGNORE = ['chrY', 'chrM']
 # CHROMS_TO_IGNORE = [] # Debug
 
+# Chromosomes used for the genome-wide normalization constants: autosomes only.
+# A purely numeric name (after an optional `chr` prefix) is an autosome in every
+# assembly, so this also drops chrX/chrY (sex and X dosage dependent), chrM
+# (high-copy and artifact-prone) and _alt/_random/chrUn contigs (redundant or
+# multi-mapping sequence that would inflate both N and the total signal)
+AUTOSOME_RE = re.compile(r'^(chr)?\d+$')
+
 def nan_average(values, weights=None):
     masked_values = np.ma.masked_array(values, np.isnan(values))
     avg = np.ma.average(masked_values, weights=weights)
     if isinstance(avg, np.ma.MaskedArray):
         return avg.filled(np.nan)
     return avg
+
+
+# Window weightings of the weighted scores, in addition to the unweighted average
+#   beta : beta_i = n_live / N, the fraction of bins kept by the live bin mask (random_walk)
+WINDOW_WEIGHTINGS = ('beta',)
+
+# Ablations implemented in GenomeBinData ('None' is no ablation)
+ABLATIONS = ('None', 'Uniform', 'Uniform Random', 'Permute Binding', 'Identity', 'Uniform Structure',
+             'Expected', 'Permute Structure', 'Shuffle Binding', 'Shuffle Structure', 'Shuffle Both')
+
+
+def window_pmf(weights, values):
+    """
+    Window weights normalized to a PMF over the windows of a chromosome that have a score
+
+    Windows with a nan score get 0. This is the normalization `nan_average` applies, so
+    nan_average(values, weights) == sum_i window_pmf(weights, values)[i] * values[i]
+    over the scored windows. All nan if no scored window has a positive weight
+    """
+    scored_weights = np.where(np.isnan(values), 0.0, weights)
+    total = scored_weights.sum()
+    if total <= 0:
+        return np.full(len(scored_weights), np.nan)
+    return scored_weights / total
+
+
+def shapley_quadrant(phi_S, phi_B):
+    """Quadrant of the point (phi_S, phi_B). Axes are assigned to the non-negative side"""
+    if phi_S >= 0 and phi_B >= 0:
+        return 'I'
+    if phi_S < 0 and phi_B >= 0:
+        return 'II'
+    if phi_S < 0 and phi_B < 0:
+        return 'III'
+    return 'IV'
+
+
+def shapley_decomposition(W_SB, W_S, W_B, W_empty=0.0, alpha_floor=0.1, require_nonneg=True):
+    """
+    Two-player Shapley decomposition of the window score W_SB into structure and binding
+    affinity, from the scores of the two ablated variants of the window pair:
+
+        W_S : binding affinity replaced by ones (structure only)
+        W_B : structure replaced by the identity (binding affinity only)
+
+        phi_S = ((W_S - W_empty) + (W_SB - W_B)) / 2
+        phi_B = ((W_B - W_empty) + (W_SB - W_S)) / 2
+        alpha = phi_S / (W_SB - W_empty), the share of W_SB attributed to structure
+
+    Same as `shapley` in 8_cell_lines_reproduce/structure_binding_rel_importance_validation_all_090326.py
+
+    alpha is np.nan if |W_SB - W_empty| <= alpha_floor and, when `require_nonneg` is True,
+    also whenever (phi_S, phi_B) is outside quadrant I, i.e. one of the Shapley values is
+    negative. phi_S, phi_B, interaction and quadrant are always reported
+    """
+    phi_S = 0.5 * ((W_S - W_empty) + (W_SB - W_B))
+    phi_B = 0.5 * ((W_B - W_empty) + (W_SB - W_S))
+    interaction = W_SB - W_S - W_B + W_empty
+    total = W_SB - W_empty
+    quadrant = shapley_quadrant(phi_S, phi_B)
+    alpha = phi_S / total if abs(total) > alpha_floor else np.nan
+    if require_nonneg and quadrant != 'I':
+        alpha = np.nan
+    return dict(phi_S=phi_S, phi_B=phi_B, interaction=interaction, alpha=alpha, quadrant=quadrant)
 
 
 def check_alt_chrom_name(chrom_name, chromosome_list):
@@ -53,6 +126,94 @@ def check_alt_chrom_name(chrom_name, chromosome_list):
     return None
 
 
+def standardize_chrom_name(chrom_name):
+    """
+    Standardizes a chromosome name to the 'chr*' convention ('5', 'chr5' and 'Chr5' all become 'chr5')
+    """
+    if chrom_name[:3].lower() == 'chr':
+        chrom_name = chrom_name[3:]
+    return 'chr' + chrom_name
+
+
+def read_chrom_sizes(chrom_size_file):
+    """
+    Reads a chromosome size file into a dict of chromosome name -> size (bp), in file order
+    """
+    chrom_sizes = {}
+    with open(chrom_size_file) as in_file:
+        for line in in_file:
+            fields = line.split()
+            if fields:
+                chrom_sizes[fields[0]] = int(fields[1])
+    return chrom_sizes
+
+
+def load_region_bedgraph(bedgraph_file, chrom_name, chrom_size, min_bedgraph_value):
+    """
+    Loads the binding affinity of the single chromosome of a genomic region
+
+    The chromosome is keyed by `chrom_name` in the returned BedGraph whether the file names it
+    with or without the 'chr' prefix. A bedgraph is first reduced to the lines of the chromosome,
+    so pyBedGraph parses one chromosome instead of the whole file. The loaded values are the same
+    as when the whole file is loaded
+
+    Parameters
+    ----------
+    bedgraph_file : str
+        Bedgraph or bigWig file
+    chrom_name : str
+        Standardized ('chr*') name of the chromosome
+    chrom_size : int
+        Size of the chromosome
+    min_bedgraph_value : int
+        Minimum bedgraph value to consider a valid binding affinity
+
+    Returns
+    -------
+    BedGraph
+    """
+    alt_name = chrom_name[3:]
+    # Same test as pyBedGraph
+    is_bigwig = os.path.basename(bedgraph_file).split('.')[-1].lower() == 'bigwig'
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        if is_bigwig:
+            import pyBigWig
+            bw = pyBigWig.open(bedgraph_file)
+            file_chrom_name = check_alt_chrom_name(chrom_name, list(bw.chroms()))
+            bw.close()
+            data_file = bedgraph_file
+        else:
+            # Lines of the chromosome under either name, renamed to chrom_name
+            file_chrom_name = None
+            data_file = os.path.join(tmp_dir, 'region.bedgraph')
+            prefixes = tuple(name + sep for name in (chrom_name, alt_name) for sep in ('\t', ' '))
+            with open(bedgraph_file) as in_file, open(data_file, 'w') as out_file:
+                for line in in_file:
+                    if line.startswith(prefixes):
+                        out_file.write(chrom_name + line[len(line.split(None, 1)[0]):])
+                        file_chrom_name = chrom_name
+
+        if file_chrom_name is None:
+            log.error(f'{chrom_name} (or {alt_name}) not found in {bedgraph_file}')
+            raise ValueError(f'{chrom_name} (or {alt_name}) not found in {bedgraph_file}')
+
+        chrom_size_file = os.path.join(tmp_dir, 'region.chrom.sizes')
+        with open(chrom_size_file, 'w') as out_file:
+            out_file.write(f'{file_chrom_name}\t{chrom_size}\n')
+
+        bedgraph = BedGraph(chrom_size_file, data_file,
+                            chroms_to_load=[file_chrom_name],
+                            ignore_missing_bp=False,
+                            min_value=min_bedgraph_value)
+
+    if file_chrom_name != chrom_name:
+        # Key the chromosome by chrom_name like the rest of the sample's data
+        bedgraph.chromosome_map[chrom_name] = bedgraph.chromosome_map.pop(file_chrom_name)
+
+    return bedgraph
+
+
 def weigh_adjacency_matrix_binding_affinity(A, b):
     """
     Weighs the batch adjacency matrix (MxNxN) by the binding affinity node weights (MxN)
@@ -76,6 +237,74 @@ def weigh_adjacency_matrix_binding_affinity(A, b):
     out = A * b[:, :, None]
     out += A * b[:, None, :]
     return out
+
+
+
+def coverage_weighting_variation(A, b, method, gamma=None, print_debug=False, output_dir=None, chrom_name=None):
+    """
+    Weighs the batch adjacency matrix (MxNxN) by the binding affinity node weights (MxN)
+    according to the rule:
+    A[:,i,j] = A[:,i,j] * (b[:,i] + b[:,j])
+
+    The first dimension is the window index and is simply broadcasted over
+
+    Parameters
+    ----------
+    A : np.ndarray
+        MxNxN array of adjacency matrices
+    b : np.ndarray
+        MxN array of binding affinity node weights
+    method : str
+        The method to use for weighting
+    gamma : float, optional
+        The power to raise the binding affinity values to
+    print_debug : bool, optional
+        Whether to sample random (window, i, j) entries and write them to
+        f'{output_dir}/diagnostic/coverage_weighting.txt' for debugging
+    output_dir : str, optional
+        Directory to output diagnostic files
+
+    Returns
+    -------
+    out : np.ndarray
+        MxNxN array of weighed adjacency matrices
+    """
+    if method == "mult":
+        out = A * b[:, :, None]
+        out += A * b[:, None, :]
+    elif method == "add":
+        out = A + b[:, :, None]
+        out += b[:, None, :]
+    elif method == "mult_power":
+        w = np.clip(b, 0, None) ** gamma
+        out = A * w[:, :, None]
+        out *= w[:, None, :]
+    elif method == "quadratic":
+        w = 1.0 + gamma * b
+        out = A * w[:, :, None]
+        out *= w[:, None, :]
+    elif method.lower() == "none":
+        out = A.copy()
+
+    if print_debug:
+        # Print for random windows, i, j: A_ij, s_i, s_j
+        os.makedirs(f'{output_dir}/diagnostic', exist_ok=True)
+
+        num_windows, N, _ = A.shape
+        num_samples = 50
+
+        rng = np.random.default_rng()
+        window_idx = rng.integers(0, num_windows, size=num_samples)
+        i_idx = rng.integers(0, N, size=num_samples)
+        j_idx = rng.integers(0, N, size=num_samples)
+
+        with open(f'{output_dir}/diagnostic/coverage_weighting_{chrom_name}.txt', 'w') as out_file:
+            out_file.write(f'window\ti\tj\tA_ij\tb_i\tb_j\tout_ij\n')
+            for w, i, j in zip(window_idx, i_idx, j_idx):
+                out_file.write(f'{w}\t{i}\t{j}\t{A[w, i, j]}\t{b[w, i]}\t{b[w, j]}\t{out[w, i, j]}\n')
+
+    return out
+
 
 def threshold_peaks(p_array, num_peaks, total_peaks, to_remove, chrom_name, base_ratio):
     """
@@ -189,7 +418,89 @@ def read_bedpe_and_bin(bedpe_file, bin_size, min_hic_value):
             bedpe_data[k] = np.array(bedpe_data[k])
 
         return bedpe_data, hic_chromosomes
-    
+
+
+def genome_wide_bedgraph_stats(bedgraph, chrom_dict, bin_size):
+    """
+    Computes the genome-wide constants needed to depth-normalize binding affinity
+
+    The normalization intended for each window is the ChIP-seq style
+
+        w_i_norm = (N * w_i) / sum_{k=1}^{N} w_k
+
+    where w is the *genome-wide* binned bedgraph vector, not the window. Rather than
+    materializing that vector, the denominator is derived from the total bedgraph
+    signal
+
+        S = sum_intervals value * (end - start)
+
+    which for a per-base-pair coverage bedgraph is read_count * read_length, i.e. the
+    read depth up to a constant. `sum_k w_k` is then S / bin_size, which is exact if
+    the bins held the mean rather than the max. This makes the resulting factor
+    N * bin_size / S ~= 1 / (mean per-bp coverage), the same quantity as deeptools'
+    RPGC ("1x genome coverage") normalization.
+
+    This costs no extra pass over the bedgraph: pyBedGraph parses the whole file into
+    per-chromosome interval arrays at construction time, so the total is one dot
+    product per chromosome. The arrays already reflect the `min_value` filter applied
+    at load, so they are consistent with the `bedgraph.stats()` calls made later.
+
+    Only autosomes are counted (see `AUTOSOME_RE`), and only chromosomes that the
+    bedgraph actually has data for, so that N and S cover the same chromosomes.
+
+    Parameters
+    ----------
+    bedgraph : BedGraph
+        Loaded bedgraph/bigWig for this sample
+    chrom_dict : dict[str, ChromBinData]
+        Chromosomes being loaded. Already filtered by `chroms_to_load` and
+        `CHROMS_TO_IGNORE`
+    bin_size : int
+        Binning resolution
+
+    Returns
+    -------
+    num_bins : int
+        N, the number of bins across the chromosomes used
+    total_signal : float
+        S, the sum of value * length over all intervals in the chromosomes used
+    chroms_used : list
+        Names of the chromosomes that contributed to N and S
+    """
+    num_bins = 0
+    total_signal = 0.0
+    total_size = 0
+    chroms_used = []
+
+    for chrom_name, chrom_data in chrom_dict.items():
+        if not AUTOSOME_RE.match(chrom_name):
+            continue
+
+        if not bedgraph.has_chrom(chrom_name):
+            log.warning(f'{chrom_name} has no bedgraph data and is excluded from the '
+                        f'genome-wide normalization constants')
+            continue
+
+        chrom = bedgraph.get_chrom(chrom_name)
+        # Interval arrays are already trimmed to the intervals actually read in
+        interval_lengths = chrom.intervals[1].astype(np.int64) - chrom.intervals[0].astype(np.int64)
+        total_signal += float(chrom.value_map @ interval_lengths)
+
+        # Ceiling division to match np.arange(0, chrom_data.size, bin_size)
+        num_bins += math.ceil(chrom_data.size / bin_size)
+        total_size += chrom_data.size
+        chroms_used.append(chrom_name)
+
+    if total_size > 0:
+        # For a raw coverage bedgraph this should look like a sequencing depth.
+        # A value near 1 (or in fold-change units) means the bedgraph was already
+        # normalized (RPKM/CPM/fold-enrichment) and normalizing by total signal
+        # again would be a double normalization
+        log.info(f'Mean per-bp bedgraph value over normalization chromosomes: '
+                 f'{total_signal / total_size:.4g}')
+
+    return num_bins, total_signal, chroms_used
+
 
 class GenomeBinData:
     """
@@ -204,10 +515,24 @@ class GenomeBinData:
     chrom_dict : dict[str, ChromBinData]
         Key: Name of chromosome
         Value: ChromBinData object
+    region : tuple or None
+        (chrom, start, end) of the single window loaded instead of the sliding windows of
+        every chromosome, or None. chrom_dict then only holds `chrom` with that one window
     peak_dict : dict[str, np.ndarray]
         Key: Name of chromosome
-        Value: 1D numpy array of number of bins in chromosome. 
+        Value: 1D numpy array of number of bins in chromosome.
         Each entry represents the peak value for that bin
+    norm_chroms : list
+        Chromosomes used for the genome-wide normalization constants
+    norm_num_bins : int
+        N, the number of bins across `norm_chroms`
+    norm_total_signal : float
+        S, the total bedgraph signal (sum of value * length) over `norm_chroms`
+    norm_binned_total : float
+        S / bin_size, standing in for sum_k w_k
+    ba_norm_factor : float
+        N / (S / bin_size), the factor to depth-normalize binding affinity.
+        Currently computed and logged but not applied
     """
 
     def __init__(
@@ -226,7 +551,16 @@ class GenomeBinData:
         bin_size: int = 1,
         min_hic_value: int = 1,
         min_bedgraph_value: int = 1,
-        ba_mult: int = 1
+        ba_mult: int = 1,
+        output_dir: str = 'output',
+        coverage_weighting: str = 'mult',
+        ablation: str = 'None',
+        rng_seed: int = 0,
+        ablation_hic_10x_rep2: bool = False,
+        to_shuffle: bool = False,
+        gamma: float = None,
+        shapley: bool = False,
+        region: Tuple[str, int, int] = None
     ):
         """
         Loads in chromatin structure, binding affinity, and potentially peaks
@@ -287,11 +621,31 @@ class GenomeBinData:
             Minimum bedgraph value to consider a valid binding affinity
         ba_mult : int
             Multiplicative factor to multiply binding affinity values by
-            This is recommended if there are binding affinity values are less than 1 
+            This is recommended if there are binding affinity values are less than 1
             (i.e. non-integer values between 0 and 1)
+        output_dir : str
+            Directory to output diagnostic files
+        coverage_weighting : str
+            Method of coverage weighting (e.g., 'mult')
+        rng_seed : int
+            Random seed for reproducibility
+        to_shuffle : List[bool]
+            List of booleans indicating whether each sample should be shuffled
+        shapley : bool
+            Whether to also build the structure only and binding only graphs of every window
+            (`ChromBinData.adjacency_matrices_S`, `adjacency_matrices_B`) for the Shapley attribution.
+            They are coverage weighted like the default graph after replacing the binding
+            affinity by ones and the structure by the identity respectively
+        region : tuple, optional
+            (chrom, start, end) as returned by `chia_rep.parse_genomic_location`: a 'chr*'
+            chromosome name and a bin aligned window. If given, only that chromosome is loaded,
+            with this one window instead of the sliding windows (`window_size`, `window_stride`
+            and `chroms_to_load` are ignored). The chromosome may be named with or without the
+            'chr' prefix in each input file, and is keyed by `chrom` in `chrom_dict`
         """
         self.species_name = os.path.basename(chrom_size_file).split('.')[0]
         self.sample_name = os.path.basename(chrom_structure_file).split('.')[0]
+        self.region = region
         # Iterate through all chromosomes once because we need all data anyways
         # for this, we read in the chrom size file first
 
@@ -301,30 +655,51 @@ class GenomeBinData:
 
         # Initialize all chromosomes to be loaded
         self.chrom_dict = {}
-        with open(chrom_size_file) as in_file:
-            for line in in_file:
-                line = line.strip().split()
-                chrom_name = line[0]
-                if chroms_to_load and chrom_name not in chroms_to_load:
-                    continue
+        if region is not None:
+            # Only the chromosome of the region, keyed by its standardized name and holding one window
+            region_chrom, region_start, region_end = region
+            chrom_sizes = read_chrom_sizes(chrom_size_file)
+            size_chrom_name = check_alt_chrom_name(region_chrom, list(chrom_sizes))
+            if size_chrom_name is None:
+                log.error(f'{region_chrom} (or {region_chrom[3:]}) not found in {chrom_size_file}')
+                raise ValueError(f'{region_chrom} (or {region_chrom[3:]}) not found in {chrom_size_file}')
 
-                if chrom_name in CHROMS_TO_IGNORE:
-                    continue
+            self.chrom_dict[region_chrom] = \
+                ChromBinData(region_chrom, chrom_sizes[size_chrom_name], self.sample_name, bin_size,
+                             window_size, window_stride, region=(region_start, region_end))
 
-                chrom_size = int(line[1])
+            # The region decides the chromosome. base_chrom is only used to threshold peaks
+            chroms_to_load = None
+            base_chrom = region_chrom
+        else:
+            with open(chrom_size_file) as in_file:
+                for line in in_file:
+                    line = line.strip().split()
+                    chrom_name = line[0]
+                    if chroms_to_load and chrom_name not in chroms_to_load:
+                        continue
 
-                self.chrom_dict[chrom_name] = \
-                    ChromBinData(chrom_name, chrom_size, self.sample_name, bin_size, window_size, window_stride)
-                
+                    if chrom_name in CHROMS_TO_IGNORE:
+                        continue
+
+                    chrom_size = int(line[1])
+
+                    self.chrom_dict[chrom_name] = \
+                        ChromBinData(chrom_name, chrom_size, self.sample_name, bin_size, window_size, window_stride)
+
         # Chromosomes to remove (if either bedgraph or hic data is missing)
         to_remove = []
 
         # Read in binding affinity data
-        bedgraph = BedGraph(chrom_size_file, bedgraph_file, 
-                            chroms_to_load=chroms_to_load, 
-                            ignore_missing_bp=False, 
-                            min_value=min_bedgraph_value)
-        
+        if region is not None:
+            bedgraph = load_region_bedgraph(bedgraph_file, region_chrom, self.chrom_dict[region_chrom].size,
+                                            min_bedgraph_value)
+        else:
+            bedgraph = BedGraph(chrom_size_file, bedgraph_file,
+                                chroms_to_load=chroms_to_load,
+                                ignore_missing_bp=False,
+                                min_value=min_bedgraph_value)
+
         # Read in chromatin structure data
         is_bedpe = chrom_structure_file.endswith('.bedpe')
         if is_bedpe:
@@ -339,6 +714,10 @@ class GenomeBinData:
             hic_chromosomes = [x.name for x in hic.getChromosomes()]
             log.info(f'Chromosomes detected in {chrom_structure_file}: {hic_chromosomes}')
 
+        if region is not None and check_alt_chrom_name(region_chrom, hic_chromosomes) is None:
+            log.error(f'{region_chrom} (or {region_chrom[3:]}) not found in {chrom_structure_file}')
+            raise ValueError(f'{region_chrom} (or {region_chrom[3:]}) not found in {chrom_structure_file}')
+
         # Move base_chrom to the front for processing first
         # This is important for peak threshold computation, where we need base_chrom's ratio of peaks first
         if base_chrom in self.chrom_dict:
@@ -351,6 +730,37 @@ class GenomeBinData:
             base_chrom = list(self.chrom_dict.keys())[0] # First chrom available
             log.warning(f'Using {base_chrom} as base chromosome instead')
             # No need to reorder since base_chrom is the first one already
+
+        # GENOME-WIDE NORMALIZATION CONSTANTS
+        # Computed from the already loaded bedgraph intervals (no extra pass)
+        # Stored and logged only; the normalization itself is not applied ye
+        # self.norm_num_bins, self.norm_total_signal, self.norm_chroms = \
+        #     genome_wide_bedgraph_stats(bedgraph, self.chrom_dict, bin_size)
+
+        # # Stands in for sum_k w_k, exact if bins held the mean instead of the max
+        # self.norm_binned_total = self.norm_total_signal / bin_size
+
+        # if self.norm_binned_total > 0:
+        #     self.ba_norm_factor = self.norm_num_bins / self.norm_binned_total
+        # else:
+        #     log.error(f'No bedgraph signal found over the normalization chromosomes '
+        #               f'{self.norm_chroms} for {self.sample_name}. '
+        #               f'Using a normalization factor of 1.0')
+        #     self.ba_norm_factor = 1.0
+
+        # if chroms_to_load:
+        #     log.warning(f'chroms_to_load is set, so the "genome-wide" normalization '
+        #                 f'constants only cover {self.norm_chroms}')
+
+        # log.info(f'Normalization chromosomes: {self.norm_chroms}')
+        # log.info(f'Genome-wide bins (N): {self.norm_num_bins}, '
+        #          f'total bedgraph signal (S): {self.norm_total_signal:.6g}, '
+        #          f'sum_k w_k (S/bin_size): {self.norm_binned_total:.6g}, '
+        #          f'binding affinity normalization factor: {self.ba_norm_factor:.6g}')
+
+        # For ablation 
+        rng = np.random.default_rng(seed=rng_seed)
+        log.info(f'{self.sample_name} ablation="{ablation}" rng_seed={rng_seed}')
 
         # Common for loop
         for chrom_name, chrom_data in self.chrom_dict.items():
@@ -385,9 +795,29 @@ class GenomeBinData:
 
             b = []
             for i in range(len(window_start_idx)):
-                b.append(node_weights[window_start_idx[i]:window_end_idx[i]])
+
+                if ablation == "Uniform":
+                    b.append(np.ones(window_end_idx[i] - window_start_idx[i], dtype=np.float32))
+                elif ablation == "Uniform Random":
+                    b.append(rng.uniform(0, 1e6, size=window_end_idx[i] - window_start_idx[i]).astype(np.float32))
+                elif ablation == "Permute Binding":
+                    perm = rng.permutation(window_end_idx[i] - window_start_idx[i])
+                    temp = node_weights[window_start_idx[i]:window_end_idx[i]].copy()
+                    b.append(temp[perm])
+                else:
+                    # Anything else is unrelated to signal ablation
+                    b.append(node_weights[window_start_idx[i]:window_end_idx[i]])
+
             b = np.array(b, dtype=np.float32) # MxN array
             log.info(f'Chromosome {chrom_name} node weights shape (MxN): {b.shape}')
+
+            if to_shuffle and ablation in ["Shuffle Binding", "Shuffle Both"]:
+                window_perm = rng.permutation(b.shape[0])
+                b = b[window_perm]
+                log.info(f'{chrom_name}: shuffled binding affinity across {b.shape[0]} windows')
+            else:
+                window_perm = None
+
             chrom_data.node_weights = b
 
             # PEAKS
@@ -455,7 +885,6 @@ class GenomeBinData:
             # Free data for chromosome
             bedgraph.free_chrom_data(chrom_name)
 
-
             # CHROMATIN STRUCTURE
             chrom_name_hic = check_alt_chrom_name(chrom_name, hic_chromosomes)
             # First check if the current chrom_name exists in hic_chromosomes
@@ -499,12 +928,22 @@ class GenomeBinData:
                         nnz = np.count_nonzero(mat)
                         if nnz == 0:
                             log.warning(f'No interactions found in {chrom_name} for window {i} ({window_start[i]}-{window_end[i]})')
-                            
+
+                        if ablation == "Identity":
+                            mat = np.eye(mat.shape[0], dtype=np.float32)
+                        elif ablation == "Expected":
+                            print("Error: Expected ablation not implemented for bedpe mode")
+                            raise NotImplementedError("Expected ablation not implemented for bedpe mode")
+
                         A.append(mat)
 
             else:
                 # Hi-C mode
                 mzd = hic.getMatrixZoomData(chrom_name_hic, chrom_name_hic, "observed", normalization, "BP", int(bin_size))
+
+                if ablation == "Expected":
+                    expected_mzd = hic.getMatrixZoomData(chrom_name_hic, chrom_name_hic, "expected", normalization, "BP", int(bin_size))
+                    expected = np.asarray(expected_mzd.getExpectedValues())
 
                 for i in range(len(window_start)):
                     mat = mzd.getRecordsAsMatrix(
@@ -515,7 +954,8 @@ class GenomeBinData:
                     if mat.shape[1] == 1:
                         # Assume that any 1x1 matrix is empty
                         log.warning(f'No Hi-C data found in {chrom_name} for window {i} ({window_start[i]}-{window_end[i]})')
-                        N = min(np.floor(chrom_data.size / bin_size).astype(int), np.floor(window_size / bin_size).astype(int))
+                        # As many bins as the node weights of the window
+                        N = chrom_data.window_indices[i, 1] - chrom_data.window_indices[i, 0]
                         mat = np.zeros((N, N))
                     else:
                         mat = mat[1:, 1:] # Remove first row and column which are always 0
@@ -534,13 +974,68 @@ class GenomeBinData:
                             log.error('Error in constructing adjacency matrices: Window size mismatch')
                             raise ValueError('Error in constructing adjacency matrices: Window size mismatch')
 
+                    if ablation == "Identity":
+                        mat = np.eye(mat.shape[0], dtype=np.float32)
+
+                    elif ablation == "Uniform Structure":
+                        N = mat.shape[0]
+                        U = rng.random((N, N)) * 1e3
+                        mat = np.triu(U, 1) + np.triu(U, 1).T + np.diag(rng.random(N))
+
+                    elif ablation == "Expected":
+                        N = mat.shape[0]
+                        mat = np.zeros((N, N), dtype=np.float32)
+                        for d in range(N):
+                            np.fill_diagonal(mat[:, d:], expected[d])
+                            if d: # If non-zero, fill the other diagonal as well
+                                np.fill_diagonal(mat[d:, :], expected[d])
+
                     A.append(mat)
 
             A = np.array(A, dtype=np.float32) # MxNxN array
+
+            if to_shuffle and ablation == "Shuffle Both":
+                # We assume and will use the same window_perm shuffled indices that were used
+                # to shuffle the binding affinity data
+                A = A[window_perm]
+                log.info(f'{chrom_name}: shuffled structure across {A.shape[0]} windows with same indices as binding affinity')
+            elif to_shuffle and ablation == "Shuffle Structure":  
+                # Then we did not do binding shuffling and so window_perm has not been assigned before
+                # Draw a fresh permutation for structure shuffling only
+                window_perm = rng.permutation(A.shape[0])
+                A = A[window_perm]
+                log.info(f'{chrom_name}: shuffled structure across {A.shape[0]} windows')
+
+            if ablation == "Permute Structure":
+                # Broadcast the permutation across all M windows
+                M = A.shape[0]
+                N = A.shape[1]
+                perms = np.argsort(rng.random((M, N)), axis=1)
+                A = A[np.arange(M)[:, None, None], perms[:, :, None], perms[:, None, :]]
+
+
+            if "rep2" in self.sample_name and ablation_hic_10x_rep2:
+                # Multiply the chromatin contacts by 10 to simulate unit mismatch
+                print(f"WARNING: MULTIPLYING {self.sample_name} HI-C MATRICES BY 10 TO SIMULATE UNIT MISMATCH FOR ABLATION TESTING")
+                A *= 10.0
+            
             log.info(f'Chromosome {chrom_name} adjacency matrices shape (MxNxN): {A.shape}')
 
-            # WEIGH BY BINDING AFFINITY
-            A = weigh_adjacency_matrix_binding_affinity(A, b)
+            if shapley:
+                # Shapley attribution: the two ablated variants of every window, coverage weighted
+                # like the default graph below. Structure only: binding affinity replaced by ones.
+                # Binding only: structure replaced by the identity
+                A_S = coverage_weighting_variation(A, np.ones_like(b), method=coverage_weighting, gamma=gamma)
+                chrom_data.adjacency_matrices_S = [coo_matrix(A_S[i]) for i in range(A_S.shape[0])]
+                I = np.broadcast_to(np.eye(A.shape[1], dtype=np.float32), A.shape)
+                A_B = coverage_weighting_variation(I, b, method=coverage_weighting, gamma=gamma)
+                chrom_data.adjacency_matrices_B = [coo_matrix(A_B[i]) for i in range(A_B.shape[0])]
+                del A_S, A_B
+
+            # WEIGH BY BINDING AFFINITY (coverage weighting)
+            # A = weigh_adjacency_matrix_binding_affinity(A, b) # Pre-revision
+            A = coverage_weighting_variation(A, b, method=coverage_weighting, gamma=gamma, 
+                                             print_debug=True, output_dir=output_dir, chrom_name=chrom_name)
 
             # List of pointers to sparse matrices
             chrom_data.adjacency_matrices = [coo_matrix(A[i]) for i in range(A.shape[0])]
@@ -642,15 +1137,46 @@ class GenomeBinData:
             ssp: float = None,
             num_cores: int = 1,
             param_str: str = '',
+            report_conv_it: bool = False,
+            live_bin_rule: str = 'either',
+            min_live_bins: int = 10,
+            shapley: bool = False,
     ) -> Dict[str, float]:
         """
         Compares this sample (genome bin data) to another sample (genome bin data)
 
         Gets the comparison values for each window in each chromosome and
-        combines that into a genome-wide comparison value. Each window is given
-        a weight based on the highest loop in it. Each chromosome is weighted
-        equally
+        combines that into a genome-wide comparison value. Besides the unweighted
+        average ("dist_unweighted"), the window scores of a chromosome are averaged
+        with the window weights normalized to a PMF over the scored windows of the
+        chromosome (see `window_pmf`):
+
+            "dist_beta_weighted" : beta_i = n_live / N, the fraction of bins kept by
+                                   the live bin mask (`live_bin_rule`, `min_live_bins`).
+                                   All ones for methods other than 'random_walk'
+
+        Each chromosome is weighted equally
+
+        If `report_conv_it` is True (only meaningful for method='random_walk'),
+        the per-window score files gain 4 columns holding the iteration at
+        which the random walk of each sample converged
+
+        If `shapley` is True (method='random_walk' only, both samples loaded with shapley=True),
+        the per-window score files gain the columns W_S, W_B (scores of the structure only and
+        binding only variants of the window pair, on the same live bins) and alpha_shapley, the
+        share of the window score attributed to structure (see `shapley_decomposition`)
+
+        Samples loaded for a genomic region hold a single window, so the comparison value is
+        the score of that window. Both samples must be loaded for the same region (or both for
+        the whole genome)
         """
+        # Windows are compared by index, so both samples must hold the same windows
+        if self.region != o_loop_data.region:
+            log.error(f'Cannot compare {self.sample_name} (region {self.region}) with '
+                      f'{o_loop_data.sample_name} (region {o_loop_data.region})')
+            raise ValueError(f'Cannot compare {self.sample_name} (region {self.region}) with '
+                             f'{o_loop_data.sample_name} (region {o_loop_data.region})')
+
         # Default: Compare all the chromosomes
         if chroms_to_compare is None:
             chroms_to_compare = list(self.chrom_dict.keys())
@@ -680,7 +1206,7 @@ class GenomeBinData:
             log.info(f"Comparing {chrom_name} ...")
 
             # Returns a list of distance values for each window comp
-            dist_values_windows, weights, max_graph, o_max_graph = self.chrom_dict[chrom_name].compare(
+            dist_values_windows, weights, max_graph, o_max_graph, converged_it, shapley_scores = self.chrom_dict[chrom_name].compare(
                 o_chrom=o_loop_data.chrom_dict[chrom_name],
                 alpha=alpha,
                 method=method,
@@ -697,10 +1223,18 @@ class GenomeBinData:
                 compare_method=compare_method,
                 cross=cross,
                 ssp=ssp,
-                num_cores=num_cores
+                num_cores=num_cores,
+                report_conv_it=report_conv_it,
+                live_bin_rule=live_bin_rule,
+                min_live_bins=min_live_bins,
+                shapley=shapley
             )
+            # Window weights normalized to a PMF over the scored windows of this chromosome.
+            # nan_average applies the same normalization, so the weighted average below is sum_i pmf_i * score_i
+            beta_pmf = window_pmf(weights, dist_values_windows)
+
             chrom_comp_values = []
-            # Index 0: Weighted average
+            # Index 0: Weighted average (beta for random_walk)
             try:
                 chrom_comp_values.append(nan_average(dist_values_windows, weights=weights))
             except ZeroDivisionError:
@@ -718,34 +1252,50 @@ class GenomeBinData:
             window_starts = self.chrom_dict[chrom_name].window_locations[:, 0]
             window_ends = self.chrom_dict[chrom_name].window_locations[:, 1]
 
+            # Column names for the converged iteration of each sample's random walk
+            conv_it_cols = f'\tconverged_it_{self.sample_name}\tconverged_it_{o_loop_data.sample_name}' \
+                if report_conv_it else ''
+            # Column names for the Shapley attribution
+            shapley_cols = '\tW_S\tW_B\talpha_shapley' if shapley else ''
+
             with open(f'{output_dir}/{param_str}/scores/windows/'
                       f'{comparison_name}_{chrom_name}.txt', 'w') as out_file:
                 out_file.write(
                     f'chrom_name\twindow_start\twindow_end\t'
-                    f'{method}\twindow_weights\tmax_graph\to_max_graph\n')
+                    f'{method}_score\tbeta\tbeta_pmf{conv_it_cols}{shapley_cols}\n')
                 for i in range(len(dist_values_windows)):
                     window_start = window_starts[i]
                     window_end = window_ends[i]
                     dist_value = dist_values_windows[i]
-                    weight = weights[i]
-                    max_window = max_graph[i]
-                    o_max_window = o_max_graph[i]
+                    weight = weights[i] # beta = n_live / N (random_walk)
+                    # max_window = max_graph[i] # deprecated
+                    # o_max_window = o_max_graph[i] # deprecated
+                    conv_it_values = f'\t{converged_it[i, 0]}\t{converged_it[i, 1]}\t{converged_it[i, 2]}\t{converged_it[i, 3]}' \
+                        if report_conv_it else ''
+                    shapley_values = ''
+                    if shapley:
+                        # W_SB is the window score. alpha only when all three scores are defined
+                        W_S, W_B = shapley_scores[i]
+                        alpha_shapley = shapley_decomposition(dist_value, W_S, W_B)['alpha'] \
+                            if np.all(np.isfinite([dist_value, W_S, W_B])) else np.nan
+                        shapley_values = f'\t{W_S}\t{W_B}\t{alpha_shapley}'
                     out_file.write(f'{chrom_name}\t{window_start}\t{window_end}'
-                                   f'\t{dist_value}\t{weight}\t{max_window}\t{o_max_window}\n')
+                                   f'\t{dist_value}\t{weight}\t{beta_pmf[i]}'
+                                   f'{conv_it_values}{shapley_values}\n')
 
         with open(f'{output_dir}/{param_str}/scores/chromosomes/'
                   f'{comparison_name}.txt', 'w') as out_file:
             out_file.write(f'chrom_name\t'
-                        f'{method}_weighted\t{method}_unweighted\n')
+                        f'{method}_score\t{method}_score_beta_weighted\n')
             for chrom_name, score_dict in chrom_score_dict.items():
-                dist_value_weighted = score_dict[0]
+                dist_value_weighted = score_dict[0] # beta-weighted (random_walk)
                 dist_value_unweighted = score_dict[1]
                 out_file.write(f'{chrom_name}\t'
-                            f'{dist_value_weighted}\t{dist_value_unweighted}\n')
+                            f'{dist_value_unweighted}\t{dist_value_weighted}\n')
 
-        # Average across each chromosome equally    
+        # Average across each chromosome equally
         avg_value = {
-            "dist_weighted" : np.mean([x[0] for x in chrom_score_dict.values()]),
+            "dist_beta_weighted" : np.mean([x[0] for x in chrom_score_dict.values()]),
             "dist_unweighted" : np.mean([x[1] for x in chrom_score_dict.values()]),
         }
         log.debug(avg_value)

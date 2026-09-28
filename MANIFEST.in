@@ -1,2 +1,2 @@
-include chia_rep/*.pyx
-include chia_rep/*.c
+include hichiarep/*.pyx
+include hichiarep/*.c

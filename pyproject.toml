@@ -1,0 +1,33 @@
+[build-system]
+# Cython is optional: setup.py falls back to the committed hichiarep/util.c
+requires = ["setuptools>=64", "setuptools_scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "HiChIA-Rep"
+dynamic = ["version"]
+description = "A package for quantifying the similarity between chromatin interactions data enriched for protein binding sites or open chromatin regions"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Sion Kim", email = "sionkim@umich.edu" }]
+dependencies = [
+    "numpy>=2.2,<2.3",
+    "scipy>=1.15,<1.16",
+    "matplotlib>=3.10,<3.11",
+    "threadpoolctl",
+    "click",
+    "pybedgraph>=0.5",
+    "pyBigWig>=0.3.16",
+    "hic-straw==1.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/minjikimlab/hichiarep"
+
+[tool.setuptools]
+packages = ["hichiarep"]
+include-package-data = true
+
+# Version comes from the latest git tag (e.g. v0.3.0 -> 0.3.0)
+[tool.setuptools_scm]

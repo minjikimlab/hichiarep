@@ -173,6 +173,7 @@ The main program will then take the generated **pairs file** and **sample input 
 | `--min-hic-value` | int (1) | Minimum Hi-C value to consider a valid interaction |
 | `--min-bedgraph-value` | int (1) | Minimum bedgraph value to consider valid binding affinity |
 | `--do-output-graph` | bool (False) | Output processed .npy graphs for chr1 windows (debugging) |
+| `--genomic-location` | str ("all") | Compare a single region `chrom:start-end` (bp) instead of sliding windows over the genome (see [Comparing a single genomic region](#comparing-a-single-genomic-region)) |
 
 It is recommended that the window size sufficiently captures important structures that you wish to compare. The window size is measured from the main diagonal and is by default 5,000,000 i.e. 5 Mb. If you wish to increase window size, such as 10 Mb, then it is recommended to keep the bin_size ≥ 10000 (at least 10 kb). 
 
@@ -209,10 +210,25 @@ python script.py example_sample_input_file.txt hg38.chrom.sizes example_pairs.tx
     --normalization NONE \
     --method random_walk \
     --mu 5 \
-    --cross False \
     --num-cores 4 \
     --compare-method spearman \
 ```
+
+#### Comparing a single genomic region
+
+HiChIA-Rep can compare a single genomic region (as opposed to a sliding window) via `--genomic-location chrom:start-end`
+
+> ### Example
+> ```bash
+> python script.py example_sample_input_file.txt hg38.chrom.sizes example_pairs.txt 5000000 10000 all \
+>     --genomic-location chr13:10000000-25000000
+> ```
+
+- `start`, `end` is half open genomic interval [start, end) (e.g. BED).
+- The genomic span is restricted to be ≥20 kb between 10 and 1000 bins (e.g. between 100kb and 10Mb at 10kb bin_size)
+- `window_size`, `--window-stride`, `chroms_to_load`, `--num-cores` are deactivated.
+- The window score is expected to be dependent with the number of bins, so it is recommended to compare with scores of the same number of bins (number of bins = genomic span / bin size).
+
 
 ## Results
 The results are contained in a folder where the main program is run, titled as `output` (default) or specified via the `--output-dir` parameter. 

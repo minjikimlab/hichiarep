@@ -18,11 +18,19 @@
 !MANIFEST.in
 !README.md
 !environment.yml
+!pyproject.toml
 
 !*.py
 !*.pyx
 !*.c
 !*.conf
+
+# Keep these last so they override the whitelist above
+__pycache__/
+*.pyc
+*.egg-info/
+/build/
+example/output/
 
 
 
