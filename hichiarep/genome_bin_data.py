@@ -511,7 +511,8 @@ class GenomeBinData:
     species_name : str
         Name of the sample's species (hg38, mm10, ...)
     sample_name : str
-        Name of the sample (LHH0061, LHH0061_0061H, ...)
+        Name of the sample: the chromatin structure file name without its extension
+        (LHH0061, LHH0061_0061H, ...)
     chrom_dict : dict[str, ChromBinData]
         Key: Name of chromosome
         Value: ChromBinData object
@@ -644,7 +645,9 @@ class GenomeBinData:
             'chr' prefix in each input file, and is keyed by `chrom` in `chrom_dict`
         """
         self.species_name = os.path.basename(chrom_size_file).split('.')[0]
-        self.sample_name = os.path.basename(chrom_structure_file).split('.')[0]
+        # Drop only the extension: names can contain dots (e.g. 'E12.5'), and cutting at the first
+        # dot gave rep1 and rep2 the same name, so their output files overwrote each other
+        self.sample_name = os.path.splitext(os.path.basename(chrom_structure_file))[0]
         self.region = region
         # Iterate through all chromosomes once because we need all data anyways
         # for this, we read in the chrom size file first
