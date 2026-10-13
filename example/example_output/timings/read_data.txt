@@ -1,4 +1,4 @@
 sample_name	time_taken
-GM12878_ctcf_chiapet_chr22_rep1	5.084643840789795
-GM12878_rnapii_chiapet_chr22_rep1	1.686302661895752
-total	6.790792942047119
+GM12878_ctcf_chiapet_chr22_rep1	5.104285478591919
+GM12878_rnapii_chiapet_chr22_rep1	1.6704518795013428
+total	6.782786130905151

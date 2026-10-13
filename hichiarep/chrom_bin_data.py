@@ -20,6 +20,11 @@ try:
 except ImportError: # Optional: should still work without this
     threadpool_limits = None
 
+try:
+    import ot # POT, only needed for compare_method="OT"
+except ImportError:
+    ot = None
+
 # from .util import * # `emd` deprecated
 
 log = logging.getLogger()
@@ -434,16 +439,71 @@ def random_walk(A, p, tol=1, report_conv_it=False, b=None, conv_tol=1e-6, max_it
 
 
 
-def compare_signals(a, b, compare_method):
-    """ Helper function for GSP methods """
+def ot_similarity(a, b, positions=None, num_iter_max=10000000):
+    """
+    Helper function for GSP methods
+
+    Earth mover's distance W (optimal transport, POT `emd2`) between the PMFs a and b,
+    transformed to a similarity 1 - 2W in [-1, 1] like the jsd
+
+    Moving mass from bin i to bin j costs |pos_i - pos_j|, their genomic distance in units of
+    the window span, so W is in [0, 1]: 0 for identical PMFs, 1 if all the mass has to cross
+    the whole window
+
+    Parameters
+    ----------
+    a, b : np.ndarray
+        PMFs over the same bins
+    positions : np.ndarray, optional
+        Position of each bin in the window, from 0 (first bin of the window) to 1 (last bin).
+        Default: consecutive bins spanning the whole window
+    num_iter_max : int
+        Maximum number of iterations of the network simplex
+
+    Returns
+    -------
+    float
+        The similarity, np.nan if a or b is not a PMF (e.g. nan after normalizing zeros)
+    """
+    if ot is None:
+        raise ImportError('compare_method "OT" needs the POT package: pip install POT')
+
+    # emd2 checks that both marginals have the same mass, so renormalize in float64
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    sum_a = a.sum()
+    sum_b = b.sum()
+    if not (np.isfinite(sum_a) and np.isfinite(sum_b) and sum_a > 0 and sum_b > 0):
+        return np.nan
+
+    if positions is None:
+        positions = np.linspace(0, 1, a.shape[0])
+    cost = np.sqrt(np.abs(positions[:, None] - positions[None, :]))
+
+    distance = ot.emd2(a / sum_a, b / sum_b, cost, numItermax=num_iter_max)
+    return 1 - 2 * distance
+
+
+def compare_signals(a, b, compare_method, positions=None):
+    """
+    Helper function for GSP methods
+
+    positions : np.ndarray, optional
+        Position of each bin in the window, from 0 to 1 (see `ot_similarity`).
+        Only used by compare_method "OT"
+    """
     if compare_method == "spearman":
         score, _ = spearmanr(a, b)
         return score
+    elif compare_method == "pearson":
+        return np.corrcoef(a, b)[0, 1]
     elif compare_method == "jsd":
         j_divergence = jensenshannon(a, b, base=2)
         # Map to [-1, 1] range and transform to similarity
         score = 2 * (1 - j_divergence) - 1 
         return score
+    elif compare_method == "OT":
+        return ot_similarity(a, b, positions)
     else:
         raise ValueError(f'Unknown compare method: {compare_method}')
 
@@ -583,6 +643,7 @@ def _random_walk_gsp_worker(args):
                                    False, min_live_bins)
     W_B, _, _ = _random_walk_score(A1_B, x1, A2_B, x2, keep, p, compare_method, cross, None,
                                    False, min_live_bins)
+    # Replace `p` with 0 to remove the blurring operation on the identity matrix
     return score, converged_it, n_live, W_S, W_B
 
 
@@ -612,7 +673,7 @@ def _random_walk_score(A1, x1, A2, x2, keep, p, compare_method, cross, ssp, repo
     if both_zero:
         return np.nan, no_conv, n_live
     if one_zero:
-        if compare_method == "spearman":
+        if compare_method in ("spearman", "pearson", "OT"):
             return 0.0, no_conv, n_live
         elif compare_method == "jsd":
             return 1.0, no_conv, n_live
@@ -636,6 +697,8 @@ def _random_walk_score(A1, x1, A2, x2, keep, p, compare_method, cross, ssp, repo
     A2 = np.ascontiguousarray(A2[np.ix_(keep, keep)])
     x1 = x1[keep]
     x2 = x2[keep]
+    # Position of each live bin in the window, from 0 (first bin) to 1 (last bin), for the OT cost
+    positions = np.flatnonzero(keep) / max(keep.size - 1, 1)
 
     # Blur
     np.clip(apply_mean_filter(A1, ks=3), 0, None, out=A1)
@@ -691,13 +754,13 @@ def _random_walk_score(A1, x1, A2, x2, keep, p, compare_method, cross, ssp, repo
         x12 = pmf(x12)
         x21 = pmf(x21)
 
-        val_a = compare_signals(x11, x12, compare_method)
-        val_b = compare_signals(x22, x21, compare_method)
+        val_a = compare_signals(x11, x12, compare_method, positions)
+        val_b = compare_signals(x22, x21, compare_method, positions)
 
         return 0.5 * (val_a + val_b), converged_it, n_live
 
     # Direct
-    return compare_signals(x11, x22, compare_method), converged_it, n_live
+    return compare_signals(x11, x22, compare_method, positions), converged_it, n_live
 
 
 def laplacian_sparse(A, laplacian_type):
@@ -802,7 +865,7 @@ def _diffusion_gsp_worker(args):
     if both_zero:
         return np.nan
     if one_zero:
-        if compare_method == "spearman":
+        if compare_method in ("spearman", "pearson", "OT"):
             return 0.0
         elif compare_method == "jsd":
             return 1.0 
@@ -1376,7 +1439,7 @@ class ChromBinData:
             OR 
             Power for random walk
         compare_method : str
-            Method to compare diffusion states (e.g., "spearman", "jsd")
+            Method to compare diffusion states ("spearman", "pearson", "jsd" or "OT")
         cross : bool
             Whether to use cross comparison
         ssp : float
@@ -1622,7 +1685,7 @@ class ChromBinData:
         compare_method : str
             Method to compare processed binding affinity signals 
             after passing through random walk or diffusion.
-            Either 'spearman' or 'jsd'
+            One of 'spearman', 'pearson', 'jsd' or 'OT' (see `compare_signals`)
         output_dir : str
             Output folder
         do_output_graph : bool

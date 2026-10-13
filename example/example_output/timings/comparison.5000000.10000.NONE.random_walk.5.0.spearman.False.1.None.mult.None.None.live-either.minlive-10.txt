@@ -1,0 +1,3 @@
+comparison	time_taken
+GM12878_ctcf_chiapet_chr22_rep1_GM12878_rnapii_chiapet_chr22_rep1	0.29418015480041504
+total	0.2980372905731201

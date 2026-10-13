@@ -1,0 +1,2 @@
+chrom_name	random_walk_score	random_walk_score_beta_weighted
+chr22	0.4116991970655355	0.47410042625231935

@@ -166,7 +166,7 @@ The main program will then take the generated **pairs file** and **sample input 
 | `-w`, `--window-stride` | int (2) | Stride factor (e.g., 2 means stride by window_size/2) |
 | `--method` | str ("random_walk") | Comparison method: "random_walk" or "diffusion" |
 | `--mu` | float (5) | Random walk steps or diffusion time parameter |
-| `--compare-method` | str ("spearman") | Signal comparison method: "spearman" or "jsd" |
+| `--compare-method` | str ("spearman") | Signal comparison method: "spearman", "pearson", "jsd" or "OT" (earth mover's distance, needs `pip install POT`) |
 | `--ba-mult` | int (1) | Multiplier for binding affinity values (use if values are <1) |
 | `--num-cores` | int (1) | Number of cores for parallel processing |
 | `--diagnostic-plots` | bool (True) | Save diagnostic plots of peak arrays |
@@ -174,6 +174,9 @@ The main program will then take the generated **pairs file** and **sample input 
 | `--min-bedgraph-value` | int (1) | Minimum bedgraph value to consider valid binding affinity |
 | `--do-output-graph` | bool (False) | Output processed .npy graphs for chr1 windows (debugging) |
 | `--genomic-location` | str ("all") | Compare a single region `chrom:start-end` (bp) instead of sliding windows over the genome (see [Comparing a single genomic region](#comparing-a-single-genomic-region)) |
+| `--shapley` | bool (False) | Also score each window with structure only (`W_S`) and binding only (`W_B`), and report `alpha_shapley`, the share of the window score attributed to structure. `random_walk` only, roughly triples the comparison time |
+| `--ablation` | str ("None") | Ablate the chromatin structure or enrichment signal: "None", "Uniform", "Uniform Random", "Permute Binding", "Identity", "Uniform Structure", "Expected", "Permute Structure", "Shuffle Binding", "Shuffle Structure" or "Shuffle Both" (for ablation studies) |
+| `--fixed-seed` | bool (False) | Use the same random seed for every sample in the randomized ablations instead of one seed per sample |
 
 It is recommended that the window size sufficiently captures important structures that you wish to compare. The window size is measured from the main diagonal and is by default 5,000,000 i.e. 5 Mb. If you wish to increase window size, such as 10 Mb, then it is recommended to keep the bin_size ≥ 10000 (at least 10 kb). 
 
@@ -212,6 +215,7 @@ python script.py example_sample_input_file.txt hg38.chrom.sizes example_pairs.tx
     --mu 5 \
     --num-cores 4 \
     --compare-method spearman \
+    --diagnostic-plots True
 ```
 
 #### Comparing a single genomic region
@@ -234,35 +238,37 @@ HiChIA-Rep can compare a single genomic region (as opposed to a sliding window) 
 The results are contained in a folder where the main program is run, titled as `output` (default) or specified via the `--output-dir` parameter. 
 
 The two main outputs are 
-1. Score matrix (.csv)
+1. Score matrices (.csv): `unweighted_scores.csv`, the average of the window scores, and `beta_weighted_scores.csv`, the average weighted by `beta`, the fraction of bins of a window that are live in both samples
 2. Window scores (.txt)
 
 > ### Example
-> `example/example_output/5000000.10000.NONE.random_walk.5.0.spearman.False.1.None/scores/unweighted_scores.csv`
+> `example/example_output/5000000.10000.NONE.random_walk.5.0.spearman.False.1.None.mult.None.None.live-either.minlive-10/scores/unweighted_scores.csv`
 > 
 > | Sample Name | GM12878_ctcf_chiapet_chr22_rep1 | GM12878_rnapii_chiapet_chr22_rep1 |
 > |-------------|----------------------------------|-----------------------------------|
-> | GM12878_ctcf_chiapet_chr22_rep1 | 0 | 0.44724015673557765 |
-> | GM12878_rnapii_chiapet_chr22_rep1 | 0.44724015673557765 | 0 |
+> | GM12878_ctcf_chiapet_chr22_rep1 | 0 | 0.4116991970655355 |
+> | GM12878_rnapii_chiapet_chr22_rep1 | 0.4116991970655355 | 0 |
 > 
-> `example/example_output/5000000.10000.NONE.random_walk.5.0.spearman.False.1.None/scores/windows/GM12878_ctcf_chiapet_chr22_rep1_loops_ENCFF780PGS_GM12878_rnapii_chiapet_chr22_rep1_loops_ENCFF040KUS_chr22.txt`
+> `example/example_output/5000000.10000.NONE.random_walk.5.0.spearman.False.1.None.mult.None.None.live-either.minlive-10/scores/windows/GM12878_ctcf_chiapet_chr22_rep1_loops_ENCFF780PGS_GM12878_rnapii_chiapet_chr22_rep1_loops_ENCFF040KUS_chr22.txt`
 > 
 > ```
-> chrom_name	window_start	window_end	random_walk	window_weights	max_graph	o_max_graph
-> chr22	0	5000000	nan	1.0	nan	nan
-> chr22	2500000	7500000	nan	1.0	nan	nan
-> chr22	5000000	10000000	nan	1.0	nan	nan
-> chr22	7500000	12500000	0.0	1.0	nan	nan
-> chr22	10000000	15000000	0.0	1.0	nan	nan
-> chr22	12500000	17500000	nan	1.0	nan	nan
-> chr22	15000000	20000000	0.8084861969998582	1.0	nan	nan
-> chr22	17500000	22500000	0.7023080606538172	1.0	nan	nan
-> chr22	20000000	25000000	0.4680814900278287	1.0	nan	nan
-> chr22	22500000	27500000	0.3643932525547642	1.0	nan	nan
-> chr22	25000000	30000000	0.4550443969407855	1.0	nan	nan
-> chr22	27500000	32500000	0.5547734297228442	1.0	nan	nan
+> chrom_name	window_start	window_end	random_walk_score	beta	beta_pmf
+> chr22	0	5000000	nan	0.0	0.0
+> chr22	2500000	7500000	nan	0.0	0.0
+> chr22	5000000	10000000	nan	0.0	0.0
+> chr22	7500000	12500000	0.0	0.0	0.0
+> chr22	10000000	15000000	0.0	0.0	0.0
+> chr22	12500000	17500000	0.42784323705824023	0.066	0.009184525466184246
+> chr22	15000000	20000000	0.4892498292849478	0.27	0.03757305872529919
+> chr22	17500000	22500000	0.39108467593088747	0.432	0.0601168939604787
+> chr22	20000000	25000000	0.38213041314086615	0.49	0.06818814361258001
+> chr22	22500000	27500000	0.4577776047041415	0.462	0.06429167826328973
+> chr22	25000000	30000000	0.4340993918777546	0.522	0.07264124686891177
+> chr22	27500000	32500000	0.5082767020329111	0.708	0.09852490954634009
 > ...
 > ```
+> 
+> With `--shapley True`, the window scores gain the columns `W_S`, `W_B` and `alpha_shapley`.
 
 
 

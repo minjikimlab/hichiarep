@@ -35,6 +35,6 @@ python script.py example_sample_input_file.txt hg38.chrom.sizes example_pairs.tx
     --normalization NONE \
     --method random_walk \
     --mu 5 \
-    --cross False \
     --num-cores 4 \
     --compare-method spearman \
+    --diagnostic-plots True

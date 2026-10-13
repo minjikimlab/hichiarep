@@ -8,9 +8,7 @@ sys.path.append('..')
 import hichiarep
 
 # To allow logging INFO level statements to stdout
-fileConfig('log.conf')
-
-
+# fileConfig('log.conf')
 # script_dir = os.path.dirname(os.path.abspath(__file__))
 # log_conf_path = os.path.join(script_dir, 'log.conf')
 # fileConfig(log_conf_path)
@@ -42,6 +40,7 @@ COVERAGE_WEIGHTING = 'mult'  # A_ij * (b_i + b_j)
 GAMMA = None                 # only used by the other coverage weightings
 LIVE_BIN_RULE = 'either'     # drop bins dead on either side of a window pair
 MIN_LIVE_BINS = 10           # windows with fewer live bins are skipped (nan)
+REPORT_CONV_IT = False      # whether to report the iteration at which the random walk converged
 
 @click.command()
 @click.version_option(hichiarep.__version__)
@@ -65,18 +64,29 @@ MIN_LIVE_BINS = 10           # windows with fewer live bins are skipped (nan)
 @click.option('--ssp', default=None, type=float)
 @click.option('--num-cores', default=1, type=int)
 @click.option('--diagnostic-plots', default=True, type=bool)
-@click.option('--report-conv-it', default=True, type=bool)
+@click.option('--ablation', default='None', type=click.Choice(hichiarep.genome_bin_data.ABLATIONS))
+@click.option('--fixed-seed', default=False, type=bool)
+@click.option('--shapley', default=False, type=bool)
 @click.option('--genomic-location', default='all', type=str)
 def main(input_data_file, chrom_size_file, compare_list_file, window_size, bin_size, chroms_to_load,
          min_hic_value, min_bedgraph_value, do_output_graph, output_dir, window_stride, num_peaks,
          normalization, method, mu, compare_method, ba_mult, ssp, num_cores, diagnostic_plots,
-         report_conv_it, genomic_location):
-    click.echo(f"Running HiChIA-Rep v{hichiarep.__version__}")
+         ablation, fixed_seed, shapley, genomic_location):
 
+    # Make the log file path within the output directory
+    os.makedirs(output_dir, exist_ok=True)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_conf_path = os.path.join(script_dir, 'log.conf')
+    log_file_path = os.path.join(output_dir, 'input.log').replace(os.sep, '/')
+    fileConfig(log_conf_path, defaults={'logfilename': log_file_path})
+
+    click.echo(f"Running HiChIA-Rep v{hichiarep.__version__}")
+    
     if 'all' in chroms_to_load or len(chroms_to_load) == 0:
         chroms_to_load = None
 
-    param_str = f'{window_size}.{bin_size}.{normalization}.{method}.{mu}.{compare_method}.{CROSS}.{ba_mult}.{ssp}.{COVERAGE_WEIGHTING}'
+    param_str = f'{window_size}.{bin_size}.{normalization}.{method}.{mu}.{compare_method}.{CROSS}.{ba_mult}.{ssp}.{COVERAGE_WEIGHTING}.{ablation}.{GAMMA}'
+    param_str += f'.live-{LIVE_BIN_RULE}.minlive-{MIN_LIVE_BINS}'
 
     if genomic_location != 'all':
         # Keep the outputs of each region apart, named by the window that is compared
@@ -87,21 +97,23 @@ def main(input_data_file, chrom_size_file, compare_list_file, window_size, bin_s
                                           window_size=window_size, window_stride=window_stride, normalization=normalization,
                                           bin_size=bin_size, output_dir=output_dir, num_peaks=num_peaks, base_chrom='chr1',
                                           min_hic_value=min_hic_value, min_bedgraph_value=min_bedgraph_value, ba_mult=ba_mult, coverage_weighting=COVERAGE_WEIGHTING,
-                                          gamma=GAMMA, genomic_location=genomic_location)
+                                          ablation=ablation, fixed_seed=fixed_seed, gamma=GAMMA, shapley=shapley,
+                                          genomic_location=genomic_location)
 
     hichiarep.preprocess(sample_data_dict, both_peak_support=False,
                         output_dir=output_dir, diagnostic_plots=diagnostic_plots)
 
-    scores_unweighted, _ = hichiarep.compare(sample_data_dict,
+    scores_unweighted, scores_weighted = hichiarep.compare(sample_data_dict,
                               compare_list_file=compare_list_file, method=method,
                               do_output_graph=do_output_graph, output_dir=output_dir,
                               mu=mu, compare_method=compare_method, cross=CROSS,
                               ssp=ssp,
                               num_cores=num_cores, param_str=param_str,
-                              report_conv_it=report_conv_it,
-                              live_bin_rule=LIVE_BIN_RULE, min_live_bins=MIN_LIVE_BINS)
-    
-    hichiarep.output_to_csv(None, scores_unweighted,
+                              report_conv_it=REPORT_CONV_IT,
+                              live_bin_rule=LIVE_BIN_RULE, min_live_bins=MIN_LIVE_BINS,
+                              shapley=shapley)
+
+    hichiarep.output_to_csv(scores_weighted, scores_unweighted,
                            output_dir=output_dir, param_str=param_str)
 
 if __name__ == '__main__':

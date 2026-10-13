@@ -154,7 +154,8 @@ def compare(
     compare_method : str
         Method to compare processed binding affinity signals 
         after passing through random walk or diffusion.
-        Either 'spearman' or 'jsd'
+        One of 'spearman', 'pearson', 'jsd' or 'OT' (earth mover's distance W with the
+        cost |i - j| in units of the window span, reported as 1 - 2W; needs the POT package)
     cross : bool
         Whether to compare the signals 'direct' or 'cross'.
 
